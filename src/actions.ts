@@ -3775,6 +3775,11 @@ const baseActions = {
       if (!ledgerNorm || ledgerNorm !== idCardNorm) {
         throw new Error("HTTP400:身份证号与案件不匹配");
       }
+      // 先校验截图大小再插行：超大拒收不留孤儿待确认记录。
+      const bytes = Buffer.from(args.screenshot.dataBase64, "base64");
+      if (bytes.length > 5 * 1024 * 1024) {
+        throw new Error("HTTP400:截图文件过大，请上传 5MB 以内的图片");
+      }
       const result = await db
         .insert(schema.payments)
         .values({
@@ -3789,10 +3794,6 @@ const baseActions = {
       if (!inserted) throw new Error("submitPaymentScreenshot: insert returned no rows");
       // 截图键与 addPayment 同规则：付款ID + 16 字节随机串，地址不可枚举猜出。
       const key = `payment-screenshots/${inserted.id}-${randomBytesBase64Url(16)}`;
-      const bytes = Buffer.from(args.screenshot.dataBase64, "base64");
-      if (bytes.length > 5 * 1024 * 1024) {
-        throw new Error("HTTP400:截图文件过大，请上传 5MB 以内的图片");
-      }
       await ctx.blobs.put(key, bytes, {
         contentType: args.screenshot.mimeType,
       });

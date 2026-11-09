@@ -49,6 +49,9 @@ function clientIp(req: import("node:http").IncomingMessage): string {
     const ip = first.split(",")[0]?.trim();
     if (ip) return ip;
   }
+  const xri = req.headers["x-real-ip"];
+  const real = Array.isArray(xri) ? xri[0] : xri;
+  if (typeof real === "string" && real.trim()) return real.trim();
   return req.socket?.remoteAddress || "unknown";
 }
 
@@ -554,7 +557,12 @@ const server = createServer(async (req, res) => {
         tooManyRequests(req, res);
         return;
       }
-      let out = await dispatch(name, body.args ?? {});
+      // 服务端定位（v16）：核验的真实 IP 由分发层注入，覆盖客户端传来的同名字段，防伪造；取不到 IP 时传空串。
+      const dispatchArgs =
+        name === "verifyIdentity"
+          ? { ...argsObj, clientIp: ip === "unknown" ? "" : ip }
+          : (body.args ?? {});
+      let out = await dispatch(name, dispatchArgs);
       if (loginRole) out = trackLoginResult(ip, loginRole, out);
       json(req, res, out.status, out.body, true);
     } catch (e) {
@@ -590,6 +598,7 @@ const server = createServer(async (req, res) => {
       const out = await dispatch("verifyIdentity", {
         idCard,
         phone: typeof body.phone === "string" ? body.phone : "",
+        clientIp: ip === "unknown" ? "" : ip,
         loginCountry:
           typeof body.loginCountry === "string" ? body.loginCountry : "",
         loginProvince:
@@ -653,7 +662,12 @@ const server = createServer(async (req, res) => {
         tooManyRequests(req, res);
         return;
       }
-      let out = await dispatch(name, args);
+      // 服务端定位（v16）：核验的真实 IP 由分发层注入，覆盖客户端传来的同名字段，防伪造；取不到 IP 时传空串。
+      const dispatchArgs =
+        name === "verifyIdentity"
+          ? { ...argsObj, clientIp: ip === "unknown" ? "" : ip }
+          : args;
+      let out = await dispatch(name, dispatchArgs);
       if (loginRole) out = trackLoginResult(ip, loginRole, out);
       json(req, res, out.status, out.body, true);
     } catch (e) {
