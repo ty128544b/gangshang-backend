@@ -61,6 +61,7 @@ export const chatMessages = sqliteTable("chat_messages", {
     .default("debtor"),
   text: text("text").notNull(),
   analysis: text("analysis").notNull().default(""),
+  imageBlobKey: text("image_blob_key"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

@@ -77,8 +77,40 @@ const chatMessageOut = z.object({
   sender: z.enum(["debtor", "agent", "system"]),
   text: z.string(),
   analysis: z.string(),
+  hasImage: z.boolean(),
+  imageUrl: z.string().nullable(),
   createdAt: z.string(),
 });
+
+/** 债务人端聊天记录：不含案件 id 与分析，只含展示所需字段。 */
+const debtorChatMessageOut = z.object({
+  id: z.number(),
+  sender: z.enum(["debtor", "agent", "system"]),
+  text: z.string(),
+  hasImage: z.boolean(),
+  imageUrl: z.string().nullable(),
+  createdAt: z.string(),
+});
+
+/** 聊天消息行转出参：有图时解析 blob 查看地址，无图时 imageUrl 为 null。 */
+async function chatMessageToOut(
+  ctx: Ctx,
+  m: typeof schema.chatMessages.$inferSelect,
+) {
+  const hasImage = !!m.imageBlobKey;
+  return {
+    id: m.id,
+    caseId: m.caseId,
+    sender: m.sender,
+    text: m.text,
+    analysis: m.analysis,
+    hasImage,
+    imageUrl: hasImage
+      ? await ctx.blobs.getUrl(m.imageBlobKey as string)
+      : null,
+    createdAt: m.createdAt.toISOString(),
+  };
+}
 
 const agreementOut = z.object({
   id: z.number(),
@@ -2036,14 +2068,9 @@ const baseActions = {
         .where(eq(schema.agreements.caseId, args.caseId))
         .orderBy(desc(schema.agreements.id));
       return {
-        messages: messages.map((m) => ({
-          id: m.id,
-          caseId: m.caseId,
-          sender: m.sender,
-          text: m.text,
-          analysis: m.analysis,
-          createdAt: m.createdAt.toISOString(),
-        })),
+        messages: await Promise.all(
+          messages.map((m) => chatMessageToOut(ctx, m)),
+        ),
         agreements: agreements.map((a) => ({
           id: a.id,
           caseId: a.caseId,
@@ -2058,21 +2085,57 @@ const baseActions = {
   }),
 
   addChatMessage: defineAction({
-    description: "往案件的聊天协商里记一条消息（债务人的话或我方回复），与网页聊天同一条记录。",
-    request: z.object({
-      caseId: z.number().int().positive(),
-      sender: z.enum(["debtor", "agent", "system"]),
-      text: z.string().min(1, "消息内容不能为空"),
-    }),
+    description:
+      "往案件的聊天协商里记一条消息（债务人的话或我方回复），与网页聊天同一条记录。文字与图片至少要有一个：只发文字、只发图片、图文一起发都可以。",
+    request: z
+      .object({
+        caseId: z.number().int().positive(),
+        sender: z.enum(["debtor", "agent", "system"]),
+        text: z.string().default(""),
+        image: z
+          .object({
+            dataBase64: z.string().min(1, "请上传图片"),
+            mimeType: z.string().regex(/^image\//, "图片必须是图片文件"),
+          })
+          .optional(),
+      })
+      .superRefine((args, ctx) => {
+        if (!args.text.trim() && !args.image) {
+          ctx.addIssue({ code: "custom", message: "消息内容不能为空" });
+        }
+      }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      // 图片先解码校验大小，超 5MB 直接拒绝，不留空消息行。
+      let bytes: Buffer | null = null;
+      if (args.image) {
+        bytes = Buffer.from(args.image.dataBase64, "base64");
+        if (bytes.length > 5 * 1024 * 1024) {
+          throw new Error("HTTP400:图片文件过大，请上传 5MB 以内的图片");
+        }
+      }
       const result = await db
         .insert(schema.chatMessages)
         .values({ caseId: args.caseId, sender: args.sender, text: args.text })
         .returning({ id: schema.chatMessages.id });
       const inserted = result[0];
       if (!inserted) throw new Error("addChatMessage: insert returned no rows");
+      if (args.image && bytes) {
+        const randomHex = Array.from(
+          crypto.getRandomValues(new Uint8Array(16)),
+        )
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+        const key = `chat-images/${inserted.id}-${randomHex}`;
+        await ctx.blobs.put(key, bytes, {
+          contentType: args.image.mimeType,
+        });
+        await db
+          .update(schema.chatMessages)
+          .set({ imageBlobKey: key })
+          .where(eq(schema.chatMessages.id, inserted.id));
+      }
       ctx.invalidateQueries();
       return { id: inserted.id };
     },
@@ -2091,6 +2154,8 @@ const baseActions = {
         .limit(1);
       const msg = rows[0];
       if (!msg) return { ok: false, analysis: "" };
+      // 纯图片消息（没有文字）无法逐句分析，直接返回空，不编造分析。
+      if (!msg.text.trim()) return { ok: false, analysis: "" };
       const caseRows = await db
         .select()
         .from(schema.cases)
@@ -2147,16 +2212,97 @@ const baseActions = {
   }),
 
   deleteChatMessage: defineAction({
-    description: "删除一条聊天协商消息。",
+    description: "删除一条聊天协商消息，消息带图片时一并删掉图片文件。",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.chatMessages)
+        .where(eq(schema.chatMessages.id, args.id))
+        .limit(1);
+      const row = rows[0];
+      if (row?.imageBlobKey) {
+        try {
+          await ctx.blobs.delete(row.imageBlobKey);
+        } catch {
+          /* 图片文件已不在也不拦删除 */
+        }
+      }
       await db
         .delete(schema.chatMessages)
         .where(eq(schema.chatMessages.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
+    },
+  }),
+
+  getChatImage: defineAction({
+    description: "取一条聊天消息的图片查看地址，没有图片时返回 null，需登录。",
+    request: z.object({ messageId: z.number().int().positive() }),
+    response: z.object({ url: z.string().nullable() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.chatMessages)
+        .where(eq(schema.chatMessages.id, args.messageId))
+        .limit(1);
+      const row = rows[0];
+      if (!row?.imageBlobKey) return { url: null };
+      const url = await ctx.blobs.getUrl(row.imageBlobKey);
+      return { url: url ?? null };
+    },
+  }),
+
+  getDebtorChat: defineAction({
+    description:
+      "债务人公开读取自己案件的聊天记录：凭案件 id 与身份证号双重校验，不需登录令牌；返回该案件的全部聊天消息，含图片查看地址。",
+    request: z.object({
+      caseId: z.number().int().positive(),
+      idCard: z
+        .string()
+        .trim()
+        .min(18, "身份证号必须为18位")
+        .max(18, "身份证号必须为18位"),
+    }),
+    response: z.object({ messages: z.array(debtorChatMessageOut) }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const idCardNorm = args.idCard.trim().toUpperCase();
+      const rows = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, args.caseId))
+        .limit(1);
+      const row = rows[0];
+      if (!row) throw new Error("HTTP400:未找到匹配的案件记录");
+      if ((row.idCard ?? "").trim().toUpperCase() !== idCardNorm) {
+        throw new Error("HTTP400:身份证号与案件不匹配");
+      }
+      const messages = await db
+        .select()
+        .from(schema.chatMessages)
+        .where(eq(schema.chatMessages.caseId, args.caseId))
+        .orderBy(asc(schema.chatMessages.id));
+      return {
+        messages: await Promise.all(
+          messages.map(async (m) => {
+            const hasImage = !!m.imageBlobKey;
+            return {
+              id: m.id,
+              sender: m.sender,
+              text: m.text,
+              hasImage,
+              imageUrl: hasImage
+                ? await ctx.blobs.getUrl(m.imageBlobKey as string)
+                : null,
+              createdAt: m.createdAt.toISOString(),
+            };
+          }),
+        ),
+      };
     },
   }),
 
@@ -3325,6 +3471,7 @@ const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "verifyIdentity",
   "getHomepageContent",
   "submitPaymentScreenshot",
+  "getDebtorChat",
 ]);
 
 // 只读查看：管理员与用户都能用
@@ -3334,6 +3481,7 @@ const READ_ACTIONS: ReadonlySet<string> = new Set([
   "verifyIdentity",
   "getCase",
   "getChat",
+  "getChatImage",
   "getPayments",
   "getPaymentScreenshot",
   "getHomepageContent",

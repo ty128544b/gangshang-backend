@@ -78,6 +78,13 @@
       "when": 1794208538916,
       "tag": "0011_add_login_location_to_debtor_logins",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1794216827589,
+      "tag": "0012_add_chat_image_to_chat_messages",
+      "breakpoints": true
     }
   ]
 }

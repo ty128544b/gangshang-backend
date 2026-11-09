@@ -533,10 +533,12 @@ const server = createServer(async (req, res) => {
         typeof body.args === "object" && body.args !== null
           ? (body.args as Record<string, unknown>)
           : {};
-      // submitPaymentScreenshot 与 verifyIdentity 共用同一核验限流窗口
+      // submitPaymentScreenshot、getDebtorChat 与 verifyIdentity 共用同一核验限流窗口
       //（同一 IP 每 10 分钟 20 次），防身份证枚举与截图接口滥用。
       if (
-        (name === "verifyIdentity" || name === "submitPaymentScreenshot") &&
+        (name === "verifyIdentity" ||
+          name === "submitPaymentScreenshot" ||
+          name === "getDebtorChat") &&
         checkVerifyLimit(ip)
       ) {
         tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
@@ -630,10 +632,12 @@ const server = createServer(async (req, res) => {
         typeof args === "object" && args !== null
           ? (args as Record<string, unknown>)
           : {};
-      // submitPaymentScreenshot 与 verifyIdentity 共用同一核验限流窗口
+      // submitPaymentScreenshot、getDebtorChat 与 verifyIdentity 共用同一核验限流窗口
       //（同一 IP 每 10 分钟 20 次），防身份证枚举与截图接口滥用。
       if (
-        (name === "verifyIdentity" || name === "submitPaymentScreenshot") &&
+        (name === "verifyIdentity" ||
+          name === "submitPaymentScreenshot" ||
+          name === "getDebtorChat") &&
         checkVerifyLimit(ip)
       ) {
         tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
