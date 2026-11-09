@@ -260,7 +260,27 @@ export const authCredentials = sqliteTable("auth_credentials", {
   userHash: text("user_hash").notNull().default(""),
   sessionSecret: text("session_secret").notNull().default(""),
   userDisabled: integer("user_disabled").notNull().default(0),
+  // 登录防爆破：每个账号连续输错次数与锁定截止时间（epoch 毫秒，0 = 未锁定）。
+  // 同一账号连续错 5 次锁 15 分钟，登录成功或管理员改密后清零。
+  adminFailCount: integer("admin_fail_count").notNull().default(0),
+  adminLockedUntil: integer("admin_locked_until").notNull().default(0),
+  userFailCount: integer("user_fail_count").notNull().default(0),
+  userLockedUntil: integer("user_locked_until").notNull().default(0),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/* ---------------- 债务人核验尝试（限流计数） ---------------- */
+
+// verifyIdentity 每次调用记一条（无论命中与否），按身份证号 / 手机号统计
+// 最近 10 分钟内的尝试次数，任一达到 20 次即拒绝并提示稍后再试；
+// 窗口外记录由核验流程顺带清理。生产 HTTP 层另有按 IP 的同口径限流。
+export const verifyAttempts = sqliteTable("verify_attempts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  idCard: text("id_card").notNull().default(""),
+  phone: text("phone").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
 });

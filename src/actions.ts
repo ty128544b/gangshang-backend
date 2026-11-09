@@ -4,8 +4,9 @@ import {
   type ActionDefinition,
   type ActionsModule,
   type Ctx,
+  type SpaceDb,
 } from "./shim";
-import { asc, desc, eq } from "drizzle-orm";
+import { asc, desc, eq, gt, lt, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 const caseFields = {
@@ -1627,6 +1628,11 @@ const baseActions = {
       if (!idCardNorm) {
         return { found: false, matchedByIdCard: false, phoneChanged: false, case: null };
       }
+      // 核验限流（库表持久化，防身份证号爆破/扫描）：先数最近 10 分钟的尝试
+      // 再决定放不放行；被限流的尝试不再记入，避免窗口被堵后无限延长；
+      // 顺带清理窗口外旧记录。同一身份证号或手机号 10 分钟内最多 20 次，
+      // 全站 10 分钟 600 次兜底。生产 HTTP 层另有按 IP 的同口径限流。
+      await checkVerifyRateLimit(db, idCardNorm, phoneNorm);
       const rows = await db
         .select()
         .from(schema.cases)
@@ -2271,6 +2277,9 @@ const baseActions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const idCardNorm = args.idCard.trim().toUpperCase();
+      // 限流与核验同口径（库表持久化）：先数最近 10 分钟同一身份证号的尝试
+      // 再决定放不放行；被限流的尝试不再记入；顺带清理窗口外旧记录。
+      await checkVerifyRateLimit(db, idCardNorm, "");
       const rows = await db
         .select()
         .from(schema.cases)
@@ -2485,6 +2494,9 @@ const baseActions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const idCardNorm = args.idCard.trim().toUpperCase();
+      // 限流与核验同口径（库表持久化）：先数最近 10 分钟同一身份证号的尝试
+      // 再决定放不放行；被限流的尝试不再记入；顺带清理窗口外旧记录。
+      await checkVerifyRateLimit(db, idCardNorm, "");
       const rows = await db
         .select()
         .from(schema.cases)
@@ -3174,13 +3186,15 @@ const baseActions = {
   }),
 
   login: defineAction({
-    description: "后台登录：选择管理员或用户账号并输入对应密码，成功返回会话令牌。",
+    description:
+      "后台登录：选择管理员或用户账号并输入对应密码，成功返回会话令牌。防爆破：同一账号连续输错 5 次锁定 15 分钟，锁定期间输对密码也进不来；登录成功清零失败计数。",
     request: z.object({
       role: z.enum(["admin", "user"]),
       password: z.string().min(1, "请输入密码"),
     }),
     response: loginOut,
     async handler(ctx, args): Promise<z.infer<typeof loginOut>> {
+      const db = ctx.db<typeof schema>();
       const row = await loadCredentials(ctx);
       if (!row) {
         return {
@@ -3198,9 +3212,60 @@ const baseActions = {
           error: "用户账号已被管理员停用，无法登录。",
         };
       }
+      const failCount =
+        args.role === "admin" ? row.adminFailCount : row.userFailCount;
+      const lockedUntil =
+        args.role === "admin" ? row.adminLockedUntil : row.userLockedUntil;
+      const now = Date.now();
+      if (lockedUntil > now) {
+        const mins = Math.max(1, Math.ceil((lockedUntil - now) / 60_000));
+        return {
+          ok: false,
+          token: null,
+          role: null,
+          error: `连续输错密码次数过多，该账号已锁定，请 ${mins} 分钟后再试。`,
+        };
+      }
       const stored = args.role === "admin" ? row.adminHash : row.userHash;
       if (!(await verifyPassword(args.password, stored))) {
+        // 原子递增：并发下多次输错也不会互相覆盖计数（SQL 层 +1，再读回最新值定夺）。
+        // 先查后写在这里是错的——PBKDF2 验密耗时几十毫秒，并发请求会全读到旧计数。
+        if (args.role === "admin") {
+          await db
+            .update(schema.authCredentials)
+            .set({
+              adminFailCount: sql`${schema.authCredentials.adminFailCount} + 1`,
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.authCredentials.id, row.id));
+        } else {
+          await db
+            .update(schema.authCredentials)
+            .set({
+              userFailCount: sql`${schema.authCredentials.userFailCount} + 1`,
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.authCredentials.id, row.id));
+        }
+        const fresh = await loadCredentials(ctx);
+        const next = fresh
+          ? args.role === "admin"
+            ? fresh.adminFailCount
+            : fresh.userFailCount
+          : 0;
+        if (next >= LOGIN_MAX_FAILURES) {
+          await updateLoginLockState(ctx, row.id, args.role, 0, now + LOGIN_LOCK_MS);
+          return {
+            ok: false,
+            token: null,
+            role: null,
+            error: "密码不正确。已连续输错 5 次，该账号锁定 15 分钟，请稍后再试。",
+          };
+        }
         return { ok: false, token: null, role: null, error: "密码不正确，请重新输入。" };
+      }
+      if (failCount !== 0 || lockedUntil !== 0) {
+        await updateLoginLockState(ctx, row.id, args.role, 0, 0);
       }
       return {
         ok: true,
@@ -3269,16 +3334,29 @@ const baseActions = {
       const db = ctx.db<typeof schema>();
       const row = await loadCredentials(ctx);
       if (!row) throw new Error("尚未设置密码。");
-      const patch: { adminHash?: string; userHash?: string; updatedAt: Date } = {
+      const patch: {
+        adminHash?: string;
+        userHash?: string;
+        adminFailCount?: number;
+        adminLockedUntil?: number;
+        userFailCount?: number;
+        userLockedUntil?: number;
+        updatedAt: Date;
+      } = {
         updatedAt: new Date(),
       };
       if (args.adminPassword) {
         if (args.adminPassword.length < 4) throw new Error("管理员密码至少 4 位。");
         patch.adminHash = await hashPassword(args.adminPassword);
+        // 改密即解锁：清掉该账号的输错计数与锁定
+        patch.adminFailCount = 0;
+        patch.adminLockedUntil = 0;
       }
       if (args.userPassword) {
         if (args.userPassword.length < 4) throw new Error("用户密码至少 4 位。");
         patch.userHash = await hashPassword(args.userPassword);
+        patch.userFailCount = 0;
+        patch.userLockedUntil = 0;
       }
       if (!patch.adminHash && !patch.userHash) throw new Error("没有要修改的密码。");
       await db
@@ -3308,6 +3386,107 @@ const baseActions = {
     },
   }),
 } satisfies ActionsModule;
+
+/* 限流拒绝文案与 429 的契约（与 401/403 契约同一套机制）：
+   一切库表限流拒绝统一用这条文案——含「稍后再试」、不含「未登录」「只认管理员」。
+   分发层按文案定状态码：含「稍后再试」→ 429。 */
+const RATE_LIMIT_MESSAGE = "操作过于频繁，请稍后再试。";
+
+/* 债务人核验限流口径（库表持久化，verify_attempts 表计数）：
+   同一身份证号或同一手机号，10 分钟内最多核验 20 次；
+   全站 10 分钟总量上限 600 次兜底防扫描。
+   生产 HTTP 层另按 IP 做同口径（同 IP 10 分钟 20 次）限流。 */
+const VERIFY_WINDOW_MS = 10 * 60 * 1000;
+const VERIFY_MAX_PER_WINDOW = 20;
+const VERIFY_GLOBAL_MAX_PER_WINDOW = 600;
+
+// 核验限流（库表持久化）：先数最近 10 分钟的尝试再决定放不放行；
+// 被限流的尝试不再记入，避免窗口被堵后无限延长；顺带清理窗口外旧记录。
+// 身份证号归一化比对（去全部空格、转大写）；手机号有值时也按手机号计数。
+// 检查+记入必须串行：并发下先查后插会互相看不到计数，导致同一窗口内超发
+//（单容器部署，进程内互斥即够用；计数本身仍落库表，重启不丢）。
+let verifyLimitQueue: Promise<void> = Promise.resolve();
+function checkVerifyRateLimit(
+  db: SpaceDb<typeof schema>,
+  idCardNorm: string,
+  phoneNorm: string,
+): Promise<void> {
+  const run = verifyLimitQueue.then(() =>
+    checkVerifyRateLimitInner(db, idCardNorm, phoneNorm),
+  );
+  verifyLimitQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+async function checkVerifyRateLimitInner(
+  db: SpaceDb<typeof schema>,
+  idCardNorm: string,
+  phoneNorm: string,
+): Promise<void> {
+  const windowStart = new Date(Date.now() - VERIFY_WINDOW_MS);
+  const recentAttempts = await db
+    .select()
+    .from(schema.verifyAttempts)
+    .where(gt(schema.verifyAttempts.createdAt, windowStart));
+  const norm = (v: string | null | undefined) =>
+    (v ?? "").replace(/\s+/g, "").toUpperCase();
+  const idAttempts = recentAttempts.filter(
+    (a) => norm(a.idCard) === norm(idCardNorm),
+  ).length;
+  const phoneAttempts =
+    phoneNorm !== ""
+      ? recentAttempts.filter((a) => (a.phone ?? "") === phoneNorm).length
+      : 0;
+  if (
+    idAttempts >= VERIFY_MAX_PER_WINDOW ||
+    phoneAttempts >= VERIFY_MAX_PER_WINDOW ||
+    recentAttempts.length >= VERIFY_GLOBAL_MAX_PER_WINDOW
+  ) {
+    throw new Error(RATE_LIMIT_MESSAGE);
+  }
+  await db
+    .insert(schema.verifyAttempts)
+    .values({ idCard: norm(idCardNorm), phone: phoneNorm });
+  await db
+    .delete(schema.verifyAttempts)
+    .where(lt(schema.verifyAttempts.createdAt, windowStart));
+}
+
+/* 登录防爆破（库表持久化，auth_credentials 表的锁定列）：
+   同一账号连续输错 5 次锁定 15 分钟，按账号计，不依赖请求 IP；
+   生产 HTTP 层另有按 IP+账号 的同口径拦截）。
+   登录成功、或管理员给该账号改了密码，计数与锁定一并清零。 */
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+
+async function updateLoginLockState(
+  ctx: Ctx,
+  rowId: number,
+  role: AuthRole,
+  failCount: number,
+  lockedUntil: number,
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const patch =
+    role === "admin"
+      ? {
+          adminFailCount: failCount,
+          adminLockedUntil: lockedUntil,
+          updatedAt: new Date(),
+        }
+      : {
+          userFailCount: failCount,
+          userLockedUntil: lockedUntil,
+          updatedAt: new Date(),
+        };
+  await db
+    .update(schema.authCredentials)
+    .set(patch)
+    .where(eq(schema.authCredentials.id, rowId));
+}
 
 /* ---------------- 登录凭据与会话 ---------------- */
 

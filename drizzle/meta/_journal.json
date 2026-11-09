@@ -85,6 +85,13 @@
       "when": 1794216827589,
       "tag": "0012_add_chat_image_to_chat_messages",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1794217221690,
+      "tag": "0013_add_login_lockout_and_verify_attempts",
+      "breakpoints": true
     }
   ]
 }

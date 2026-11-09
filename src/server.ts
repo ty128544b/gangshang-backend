@@ -356,7 +356,9 @@ async function dispatch(
       ? 401
       : msg.includes("只认管理员")
         ? 403
-        : 500;
+        : msg.includes("稍后再试")
+          ? 429
+          : 500;
     return { status, body: { error: msg } };
   }
 }
