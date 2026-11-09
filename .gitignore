@@ -5,3 +5,5 @@ data/
 *.db-shm
 *.db.restored
 .env
+credentials.txt
+.gh-token
