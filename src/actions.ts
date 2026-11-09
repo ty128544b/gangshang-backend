@@ -1567,10 +1567,10 @@ const baseActions = {
 
   verifyIdentity: defineAction({
     description:
-      "债务人登录身份核验：以身份证号为主要核验依据匹配案件记录，手机号仅作辅助；债务人换了手机号时，只要身份证号与案件记录一致即可认出其案件。身份证号未命中时不返回任何案件信息。核验成功时记一条该案件的登录记录（debtor_logins）：保存本次登录填写的手机号（与台账手机号不一致也照记，两个都保留），以及债务人网页按本次登录请求 IP 解析出的地理位置（loginCountry/loginProvince/loginCity，国家/省/市，可空——网页静默解析、不要求债务人授权定位，解析不到就不带，核验流程不受影响），供后台名单展示登录地点并与台账地区比对。",
+      "债务人登录身份核验：以身份证号为核验依据匹配案件记录，手机号必填（现用手机号即可，不要求与台账手机号一致；换了手机号时，只要身份证号与案件记录一致即可认出其案件）。身份证号未命中时不返回任何案件信息。核验成功时记一条该案件的登录记录（debtor_logins）：保存本次登录填写的手机号（与台账手机号不一致也照记，两个都保留），以及债务人网页按本次登录请求 IP 解析出的地理位置（loginCountry/loginProvince/loginCity，国家/省/市，可空——网页静默解析、不要求债务人授权定位，解析不到就不带，核验流程不受影响），供后台名单展示登录地点并与台账地区比对。",
     request: z.object({
       idCard: z.string().min(1, "身份证号不能为空"),
-      phone: z.string().default(""),
+      phone: z.string().trim().min(1, "请填写手机号"),
       loginCountry: z.string().default(""),
       loginProvince: z.string().default(""),
       loginCity: z.string().default(""),
@@ -2299,7 +2299,12 @@ const baseActions = {
       const inserted = result[0];
       if (!inserted) throw new Error("addPayment: insert returned no rows");
       if (args.screenshot) {
-        const key = `payment-screenshots/${inserted.id}`;
+        const randomHex = Array.from(
+          crypto.getRandomValues(new Uint8Array(16)),
+        )
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+        const key = `payment-screenshots/${inserted.id}-${randomHex}`;
         const bytes = Buffer.from(args.screenshot.dataBase64, "base64");
         await ctx.blobs.put(key, bytes, {
           contentType: args.screenshot.mimeType,

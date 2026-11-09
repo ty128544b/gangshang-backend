@@ -14,8 +14,9 @@
 //   GET  /admin/backup      下载 SQLite 库文件（需 ADMIN_BACKUP_TOKEN）
 //   POST /admin/restore     上传 SQLite 库文件，重启后生效（需 ADMIN_BACKUP_TOKEN）
 //   WS   <WS_PATH>          Upgrade 请求裸 TCP 透传给本机 xray(10000)
-// 跨域：前端在 Netlify、后端在 orkestr，/actions 与 /api/* 允许任意源
-// （含 x-request-id 请求头），并处理 OPTIONS 预检。
+// 跨域：前端在 Netlify、后端在 orkestr，只放行 Netlify 与本后台 artifact
+// 域名（含 x-request-id / authorization 请求头），并处理 OPTIONS 预检。
+// 无 Origin 头的请求（curl、服务端调用）不做跨域限制。
 import { createServer } from "node:http";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -38,6 +39,159 @@ const MIGRATIONS_DIR =
 const BLOBS_DIR = join(DATA_DIR, "blobs");
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 const BACKUP_TOKEN = process.env.ADMIN_BACKUP_TOKEN || "";
+
+// ---------- 安全加固：限流 / 跨域 / 安全头（内存 Map，单进程） ----------
+
+function clientIp(req: import("node:http").IncomingMessage): string {
+  const xff = req.headers["x-forwarded-for"];
+  const first = Array.isArray(xff) ? xff[0] : xff;
+  if (typeof first === "string") {
+    const ip = first.split(",")[0]?.trim();
+    if (ip) return ip;
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function setSecurityHeaders(
+  res: import("node:http").ServerResponse,
+  noStore = false,
+): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  if (noStore) res.setHeader("Cache-Control", "no-store");
+}
+
+function isAllowedOrigin(origin: string): boolean {
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "https:") return false;
+    if (u.hostname === "candid-treacle-049289.netlify.app") return true;
+    if (u.hostname.endsWith(".netlify.app")) return true;
+    if (u.hostname.endsWith(".muse.ai")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function setCors(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+): void {
+  res.setHeader("Vary", "Origin");
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && origin) {
+    if (isAllowedOrigin(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "content-type, x-request-id, authorization",
+      );
+    }
+  }
+}
+
+function applyHeaders(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+  noStore = false,
+): void {
+  setSecurityHeaders(res, noStore);
+  setCors(req, res);
+}
+
+type RateWindow = { count: number; windowStart: number };
+
+// 窗口内计数，超限返回 true；窗口过期重置；条目过多时清过期条目。
+function hitWindow(
+  map: Map<string, RateWindow>,
+  key: string,
+  windowMs: number,
+  max: number,
+): boolean {
+  const now = Date.now();
+  if (map.size > 5000) {
+    for (const [k, v] of map) {
+      if (now - v.windowStart > windowMs) map.delete(k);
+    }
+  }
+  const entry = map.get(key);
+  if (!entry || now - entry.windowStart > windowMs) {
+    map.set(key, { count: 1, windowStart: now });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > max;
+}
+
+const genericLimits = new Map<string, RateWindow>();
+const verifyLimits = new Map<string, RateWindow>();
+const backupFailLimits = new Map<string, RateWindow>();
+const loginFailures = new Map<
+  string,
+  { failures: number; lockedUntil: number }
+>();
+
+function checkGenericLimit(ip: string): boolean {
+  return hitWindow(genericLimits, ip, 60_000, 300);
+}
+
+function checkVerifyLimit(ip: string): boolean {
+  return hitWindow(verifyLimits, ip, 10 * 60_000, 20);
+}
+
+function checkBackupFailLimit(ip: string): boolean {
+  return hitWindow(backupFailLimits, ip, 15 * 60_000, 5);
+}
+
+function isLoginLocked(ip: string, role: string): boolean {
+  const entry = loginFailures.get(`${ip}:${role}`);
+  if (!entry) return false;
+  // lockedUntil 为 0 表示尚未上锁（仅累计失败次数），不能按过期清理。
+  if (entry.lockedUntil === 0) return false;
+  if (Date.now() >= entry.lockedUntil) {
+    loginFailures.delete(`${ip}:${role}`);
+    return false;
+  }
+  return entry.failures >= 5;
+}
+
+function recordLoginFailure(ip: string, role: string): void {
+  const key = `${ip}:${role}`;
+  const entry = loginFailures.get(key) ?? { failures: 0, lockedUntil: 0 };
+  entry.failures += 1;
+  if (entry.failures >= 5) entry.lockedUntil = Date.now() + 15 * 60_000;
+  loginFailures.set(key, entry);
+}
+
+function clearLoginFailures(ip: string, role: string): void {
+  loginFailures.delete(`${ip}:${role}`);
+}
+
+// dispatch 返回后按登录结果维护失败计数；返回原 dispatch 结果。
+function trackLoginResult(
+  ip: string,
+  role: string,
+  out: { status: number; body: unknown },
+): { status: number; body: unknown } {
+  const data = (out.body as { data?: { ok?: boolean } } | null)?.data;
+  if (data?.ok === true) clearLoginFailures(ip, role);
+  else if (data?.ok === false) recordLoginFailure(ip, role);
+  return out;
+}
+
+function backupToken(
+  req: import("node:http").IncomingMessage,
+  url: URL,
+): string {
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+    return auth.slice("Bearer ".length).trim();
+  }
+  return url.searchParams.get("token") || "";
+}
 
 // xray（环境变量，不进代码；orkestr 控制台里配）
 const XRAY_UUID = process.env.XRAY_UUID || "";
@@ -223,23 +377,23 @@ function readBody(
   });
 }
 
-function cors(res: import("node:http").ServerResponse): void {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "content-type, x-request-id, authorization",
-  );
-}
-
 function json(
+  req: import("node:http").IncomingMessage,
   res: import("node:http").ServerResponse,
   status: number,
   body: unknown,
+  noStore = false,
 ): void {
-  cors(res);
+  applyHeaders(req, res, noStore);
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+function tooManyRequests(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+): void {
+  json(req, res, 429, { error: "尝试次数过多，请15分钟后再试" }, true);
 }
 
 const server = createServer(async (req, res) => {
@@ -248,30 +402,30 @@ const server = createServer(async (req, res) => {
   const path = url.pathname;
 
   if (req.method === "OPTIONS") {
-    cors(res);
+    applyHeaders(req, res);
     res.writeHead(204);
     res.end();
     return;
   }
 
   if (req.method === "GET" && path === "/health") {
-    json(res, 200, { ok: true });
+    json(req, res, 200, { ok: true });
     return;
   }
   if (req.method === "GET" && path === "/") {
-    cors(res);
+    applyHeaders(req, res);
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(adminPage());
     return;
   }
   if (req.method === "GET" && path === "/clash-meta.yaml") {
-    cors(res);
+    applyHeaders(req, res);
     res.writeHead(200, { "Content-Type": "text/yaml; charset=utf-8" });
     res.end(clashYaml(host));
     return;
   }
   if (req.method === "GET" && path === "/sub") {
-    cors(res);
+    applyHeaders(req, res);
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(subLinks(host));
     return;
@@ -280,11 +434,12 @@ const server = createServer(async (req, res) => {
     const key = decodeURIComponent(path.slice("/blobs/".length));
     const file = await blobs.read(key);
     if (!file) {
+      applyHeaders(req, res);
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("not found\n");
       return;
     }
-    cors(res);
+    applyHeaders(req, res);
     res.writeHead(200, {
       "Content-Type": file.contentType,
       "Content-Length": file.buffer.length,
@@ -293,9 +448,13 @@ const server = createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && path === "/admin/backup") {
-    const token = url.searchParams.get("token") || "";
+    const token = backupToken(req, url);
     if (!BACKUP_TOKEN || token !== BACKUP_TOKEN) {
-      json(res, 403, { error: "备份未启用或令牌不正确（配 ADMIN_BACKUP_TOKEN 环境变量）" });
+      if (checkBackupFailLimit(clientIp(req))) {
+        tooManyRequests(req, res);
+        return;
+      }
+      json(req, res, 403, { error: "备份未启用或令牌不正确（配 ADMIN_BACKUP_TOKEN 环境变量）" });
       return;
     }
     try {
@@ -306,7 +465,7 @@ const server = createServer(async (req, res) => {
     const file = dbFilePath(DATA_DIR);
     try {
       const buf = readFileSync(file);
-      cors(res);
+      applyHeaders(req, res);
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
         "Content-Disposition": `attachment; filename="gangshang-${new Date().toISOString().slice(0, 10)}.db"`,
@@ -314,36 +473,45 @@ const server = createServer(async (req, res) => {
       });
       res.end(buf);
     } catch (e) {
-      json(res, 500, { error: `读取库文件失败：${(e as Error).message}` });
+      json(req, res, 500, { error: `读取库文件失败：${(e as Error).message}` });
     }
     return;
   }
   if (req.method === "POST" && path === "/admin/restore") {
-    const token = url.searchParams.get("token") || "";
+    const token = backupToken(req, url);
     if (!BACKUP_TOKEN || token !== BACKUP_TOKEN) {
-      json(res, 403, { error: "恢复未启用或令牌不正确（配 ADMIN_BACKUP_TOKEN 环境变量）" });
+      if (checkBackupFailLimit(clientIp(req))) {
+        tooManyRequests(req, res);
+        return;
+      }
+      json(req, res, 403, { error: "恢复未启用或令牌不正确（配 ADMIN_BACKUP_TOKEN 环境变量）" });
       return;
     }
     try {
       const buf = await readBody(req, 200 * 1024 * 1024);
       if (buf.length < 100 || buf.subarray(0, 6).toString() !== "SQLite") {
-        json(res, 400, { error: "上传的文件不是 SQLite 库文件" });
+        json(req, res, 400, { error: "上传的文件不是 SQLite 库文件" });
         return;
       }
       writeFileSync(join(DATA_DIR, "gangshang.db.restored"), buf);
-      json(res, 200, {
+      json(req, res, 200, {
         ok: true,
         note: "已接收，服务即将重启，重启后自动用上传的库文件替换当前库。",
       });
       setTimeout(() => process.exit(0), 500);
     } catch (e) {
-      json(res, 500, { error: `恢复失败：${(e as Error).message}` });
+      json(req, res, 500, { error: `恢复失败：${(e as Error).message}` });
     }
     return;
   }
 
   // POST /actions：空间风格 {action, args, actionCallId}
   if (req.method === "POST" && path === "/actions") {
+    const ip = clientIp(req);
+    if (checkGenericLimit(ip)) {
+      tooManyRequests(req, res);
+      return;
+    }
     try {
       const raw = await readBody(req, 10 * 1024 * 1024);
       const body = JSON.parse(raw.toString("utf-8") || "{}") as {
@@ -352,19 +520,45 @@ const server = createServer(async (req, res) => {
       };
       const name = typeof body.action === "string" ? body.action : "";
       if (!name) {
-        json(res, 400, { error: "缺少 action 字段" });
+        json(req, res, 400, { error: "缺少 action 字段" }, true);
         return;
       }
-      const out = await dispatch(name, body.args ?? {});
-      json(res, out.status, out.body);
+      const argsObj =
+        typeof body.args === "object" && body.args !== null
+          ? (body.args as Record<string, unknown>)
+          : {};
+      if (name === "verifyIdentity" && checkVerifyLimit(ip)) {
+        tooManyRequests(req, res);
+        return;
+      }
+      const loginRole =
+        name === "login" && typeof argsObj.role === "string"
+          ? argsObj.role
+          : "";
+      if (loginRole && isLoginLocked(ip, loginRole)) {
+        tooManyRequests(req, res);
+        return;
+      }
+      let out = await dispatch(name, body.args ?? {});
+      if (loginRole) out = trackLoginResult(ip, loginRole, out);
+      json(req, res, out.status, out.body, true);
     } catch (e) {
-      json(res, 400, { error: `请求解析失败：${(e as Error).message}` });
+      json(req, res, 400, { error: `请求解析失败：${(e as Error).message}` }, true);
     }
     return;
   }
 
   // POST /api/verify：真核验（verifyIdentity 包装），兼容脚手架的旧端点。
   if (req.method === "POST" && path === "/api/verify") {
+    const ip = clientIp(req);
+    if (checkGenericLimit(ip)) {
+      tooManyRequests(req, res);
+      return;
+    }
+    if (checkVerifyLimit(ip)) {
+      tooManyRequests(req, res);
+      return;
+    }
     try {
       const raw = await readBody(req, 1 * 1024 * 1024);
       const body = JSON.parse(raw.toString("utf-8") || "{}") as Record<
@@ -373,9 +567,9 @@ const server = createServer(async (req, res) => {
       >;
       const idCard = typeof body.idCard === "string" ? body.idCard : "";
       if (!idCard.trim()) {
-        json(res, 400, {
+        json(req, res, 400, {
           error: "请提供身份证号（idCard）进行核验",
-        });
+        }, true);
         return;
       }
       const out = await dispatch("verifyIdentity", {
@@ -388,42 +582,65 @@ const server = createServer(async (req, res) => {
         loginCity: typeof body.loginCity === "string" ? body.loginCity : "",
       });
       if (out.status !== 200) {
-        json(res, out.status, out.body);
+        json(req, res, out.status, out.body, true);
         return;
       }
       const data = (out.body as { data: Record<string, unknown> }).data;
-      json(res, 200, {
+      json(req, res, 200, {
         ok: true,
         found: data.found === true,
         verified: data.found === true,
         matchedByIdCard: data.matchedByIdCard === true,
         phoneChanged: data.phoneChanged === true,
         case: data.case ?? null,
-      });
+      }, true);
     } catch (e) {
-      json(res, 400, { error: `请求解析失败：${(e as Error).message}` });
+      json(req, res, 400, { error: `请求解析失败：${(e as Error).message}` }, true);
     }
     return;
   }
 
   // POST /api/<action>：body 即 args。
   if (req.method === "POST" && path.startsWith("/api/")) {
+    const ip = clientIp(req);
+    if (checkGenericLimit(ip)) {
+      tooManyRequests(req, res);
+      return;
+    }
     const name = decodeURIComponent(path.slice("/api/".length));
     if (!name || name.includes("/")) {
-      json(res, 404, { error: "未知接口" });
+      json(req, res, 404, { error: "未知接口" }, true);
       return;
     }
     try {
       const raw = await readBody(req, 10 * 1024 * 1024);
       const args = raw.length ? JSON.parse(raw.toString("utf-8")) : {};
-      const out = await dispatch(name, args);
-      json(res, out.status, out.body);
+      const argsObj =
+        typeof args === "object" && args !== null
+          ? (args as Record<string, unknown>)
+          : {};
+      if (name === "verifyIdentity" && checkVerifyLimit(ip)) {
+        tooManyRequests(req, res);
+        return;
+      }
+      const loginRole =
+        name === "login" && typeof argsObj.role === "string"
+          ? argsObj.role
+          : "";
+      if (loginRole && isLoginLocked(ip, loginRole)) {
+        tooManyRequests(req, res);
+        return;
+      }
+      let out = await dispatch(name, args);
+      if (loginRole) out = trackLoginResult(ip, loginRole, out);
+      json(req, res, out.status, out.body, true);
     } catch (e) {
-      json(res, 400, { error: `请求解析失败：${(e as Error).message}` });
+      json(req, res, 400, { error: `请求解析失败：${(e as Error).message}` }, true);
     }
     return;
   }
 
+  applyHeaders(req, res);
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("not found\n");
 });
