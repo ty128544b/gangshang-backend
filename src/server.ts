@@ -203,7 +203,7 @@ const CLOADY_SERVER = process.env.CLOADY_SERVER || "";
 const CLOADY_UUID = process.env.CLOADY_UUID || "";
 const CLOADY_PATH = process.env.CLOADY_PATH || "";
 
-// ---------- 订阅（Cloady + orkestr 双节点；Cloady 未配时只出 orkestr） ----------
+// ---------- 订阅（Cloady + orkestr 双节点；只配其一时只出那一个） ----------
 
 function clashYaml(host: string): string {
   const nodes: string[] = [];

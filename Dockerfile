@@ -4,7 +4,8 @@
 # Node 直接监听 $PORT 并透传 WS 升级请求给本机 xray（去掉 nginx：平台以
 # 非 root 用户运行容器，nginx 读配置前 chown 临时目录会报 Operation not
 # permitted；Node 透传方案已在真实拨测验证通过）。
-# 敏感值一律走环境变量，不进镜像层：XRAY_UUID / XRAY_WS_PATH（必填），
+# 敏感值一律走环境变量，不进镜像层：XRAY_UUID / XRAY_WS_PATH（同时配了才启动
+# xray；不配则只跑后端，订阅里只出 Cloady 节点），
 # CLOADY_SERVER / CLOADY_UUID / CLOADY_PATH（合并订阅用，可空），
 # ADMIN_BACKUP_TOKEN（备份/恢复令牌，可空=禁用），DATA_DIR（默认 /srv/app/data）。
 FROM ghcr.io/xtls/xray-core:latest AS xray
