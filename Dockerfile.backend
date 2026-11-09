@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+# 港上后端纯后端部署：只有 Bun 后端，不含 xray（不启动任何代理、不带代理二进制）。
+# 用于条款禁代理的平台与只需要后端的部署；与主 Dockerfile 的区别只是去掉了
+# xray 阶段与 geo 文件，入口 entrypoint.sh 共用（不配 XRAY_UUID/XRAY_WS_PATH
+# 时 xray 分支不启动，订阅里只出 Cloady 节点）。
+# 环境变量：PORT（默认 8080）、DATA_DIR（默认 /srv/app/data，挂持久卷）、
+# CLOADY_SERVER / CLOADY_UUID / CLOADY_PATH（合并订阅用，可空）、
+# ADMIN_BACKUP_TOKEN（备份/恢复令牌，可空=禁用）。
+FROM oven/bun:1.4.4
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /srv/app/data \
+ && chmod 777 /srv/app/data
+WORKDIR /srv/app
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+COPY drizzle ./drizzle
+COPY src ./src
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod a+x /usr/local/bin/entrypoint.sh \
+ && chgrp -R 0 /srv/app /usr/local/bin \
+ && chmod -R g=u /srv/app /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
