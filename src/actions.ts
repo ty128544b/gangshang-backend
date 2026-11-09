@@ -1891,6 +1891,31 @@ const baseActions = {
     },
   }),
 
+  deleteAllCases: defineAction({
+    description:
+      "一键删除全部案件及其全部进度、发送记录、聊天、协议、还款记录、链接点击与登录记录，不可恢复。管理员与用户账号均可用。",
+    request: z.object({}),
+    response: z.object({ ok: z.boolean(), deletedCount: z.number() }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const existing = await db
+        .select({ id: schema.cases.id })
+        .from(schema.cases);
+      await db.batch([
+        db.delete(schema.progressSteps),
+        db.delete(schema.sendRecords),
+        db.delete(schema.chatMessages),
+        db.delete(schema.agreements),
+        db.delete(schema.payments),
+        db.delete(schema.linkClicks),
+        db.delete(schema.debtorLogins),
+        db.delete(schema.cases),
+      ]);
+      ctx.invalidateQueries();
+      return { ok: true, deletedCount: existing.length };
+    },
+  }),
+
   addStep: defineAction({
     description: "给案件进度时间线新增一个步骤。",
     request: z.object({
@@ -3247,6 +3272,21 @@ const READ_ACTIONS: ReadonlySet<string> = new Set([
   "getHomepageContent",
 ]);
 
+// 案件台账写入：管理员与用户都能建、改、删、导案件
+//（新建 / Excel 导入 / 修改 / 删除单个 / 删除全部 / 进度步骤 / 发送登记）。
+// 仍只认管理员的：聊天发送与分析、协议、还款登记与对账、改密码、停用账号。
+const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
+  "createCase",
+  "importCases",
+  "updateCase",
+  "deleteCase",
+  "deleteAllCases",
+  "addStep",
+  "updateStep",
+  "deleteStep",
+  "registerSend",
+]);
+
 // 网页首页内容（页面信息）编辑：管理员与用户都能改
 const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "addCourtCase",
@@ -3277,7 +3317,8 @@ const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
 type AnyActionDef = ActionDefinition<z.ZodType, z.ZodType>;
 
 // 给每个业务接口套上登录与角色校验：请求里多收一个 sessionToken（本地会话令牌），
-// 未登录一律拒绝；案件类的新增/修改/删除/导入只认管理员。
+// 未登录一律拒绝；只读查看、案件台账写入与网页首页内容编辑管理员与用户都能用，
+// 聊天发送、还款登记、改密码、停用账号只认管理员。
 function guardActions<T extends Record<string, AnyActionDef>>(defs: T): T {
   const out: Record<string, AnyActionDef> = {};
   for (const [name, def] of Object.entries(defs)) {
@@ -3285,7 +3326,10 @@ function guardActions<T extends Record<string, AnyActionDef>>(defs: T): T {
       out[name] = def;
       continue;
     }
-    const userAllowed = READ_ACTIONS.has(name) || PAGE_EDIT_ACTIONS.has(name);
+    const userAllowed =
+      READ_ACTIONS.has(name) ||
+      PAGE_EDIT_ACTIONS.has(name) ||
+      CASE_WRITE_ACTIONS.has(name);
     const request = (def.request as z.ZodObject<z.ZodRawShape>).passthrough();
     out[name] = {
       ...def,
@@ -3301,7 +3345,7 @@ function guardActions<T extends Record<string, AnyActionDef>>(defs: T): T {
         if (!role) throw new Error("未登录或登录已失效，请重新登录后再操作。");
         if (role !== "admin" && !userAllowed) {
           throw new Error(
-            "用户账号只能查看案件与记录、编辑网页首页内容，不能修改案件数据。",
+            "用户账号不能发送聊天、登记还款或管理账号，该操作只认管理员。",
           );
         }
         return def.handler(ctx, rec);
