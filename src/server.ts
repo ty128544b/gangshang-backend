@@ -193,7 +193,11 @@ async function dispatch(
     return { status: 200, body: { data: checked } };
   } catch (e) {
     const msg = (e as Error).message || "接口执行失败";
-    const status = msg.includes("未登录") ? 401 : 500;
+    const status = msg.includes("未登录")
+      ? 401
+      : msg.includes("只认管理员")
+        ? 403
+        : 500;
     return { status, body: { error: msg } };
   }
 }
