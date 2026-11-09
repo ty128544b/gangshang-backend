@@ -392,8 +392,9 @@ function json(
 function tooManyRequests(
   req: import("node:http").IncomingMessage,
   res: import("node:http").ServerResponse,
+  message = "尝试次数过多，请15分钟后再试",
 ): void {
-  json(req, res, 429, { error: "尝试次数过多，请15分钟后再试" }, true);
+  json(req, res, 429, { error: message }, true);
 }
 
 const server = createServer(async (req, res) => {
@@ -509,7 +510,7 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && path === "/actions") {
     const ip = clientIp(req);
     if (checkGenericLimit(ip)) {
-      tooManyRequests(req, res);
+      tooManyRequests(req, res, "请求过于频繁，请1分钟后再试");
       return;
     }
     try {
@@ -528,7 +529,7 @@ const server = createServer(async (req, res) => {
           ? (body.args as Record<string, unknown>)
           : {};
       if (name === "verifyIdentity" && checkVerifyLimit(ip)) {
-        tooManyRequests(req, res);
+        tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
         return;
       }
       const loginRole =
@@ -552,11 +553,11 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && path === "/api/verify") {
     const ip = clientIp(req);
     if (checkGenericLimit(ip)) {
-      tooManyRequests(req, res);
+      tooManyRequests(req, res, "请求过于频繁，请1分钟后再试");
       return;
     }
     if (checkVerifyLimit(ip)) {
-      tooManyRequests(req, res);
+      tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
       return;
     }
     try {
@@ -604,7 +605,7 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && path.startsWith("/api/")) {
     const ip = clientIp(req);
     if (checkGenericLimit(ip)) {
-      tooManyRequests(req, res);
+      tooManyRequests(req, res, "请求过于频繁，请1分钟后再试");
       return;
     }
     const name = decodeURIComponent(path.slice("/api/".length));
@@ -620,7 +621,7 @@ const server = createServer(async (req, res) => {
           ? (args as Record<string, unknown>)
           : {};
       if (name === "verifyIdentity" && checkVerifyLimit(ip)) {
-        tooManyRequests(req, res);
+        tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
         return;
       }
       const loginRole =
