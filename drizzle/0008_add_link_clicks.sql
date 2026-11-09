@@ -1,0 +1,5 @@
+CREATE TABLE link_clicks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_id INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);

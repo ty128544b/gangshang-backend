@@ -1,0 +1,50 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>港上管理后台</title></head>
+<body style="font-family:sans-serif;max-width:680px;margin:40px auto;padding:0 16px">
+<h1>港上管理后台</h1>
+<p>后端已跑通（真实核验，不再是演示桩）。案件台账、身份核验、聊天协商、还款确认、首页内容管理都走下方接口。</p>
+<p>状态：<span id="health">检查中…</span></p>
+
+<h2>核验接口测试（真实核验）</h2>
+<form id="f">
+  <input name="idCard" placeholder="身份证号" style="padding:8px;width:220px">
+  <input name="phone" placeholder="手机号（可空）" style="padding:8px;width:140px">
+  <button style="padding:8px 16px">核验</button>
+</form>
+<pre id="out"></pre>
+
+<h2>链接</h2>
+<ul>
+  <li><a href="/health">健康检查 /health</a></li>
+  <li><a href="/clash-meta.yaml">Clash Meta 订阅 /clash-meta.yaml</a></li>
+  <li><a href="/sub">小火箭订阅 /sub</a></li>
+</ul>
+
+<h2>数据库备份</h2>
+<p>库文件是 SQLite 单文件。容器重新部署会丢数据，请定期下载备份；恢复时用下面的恢复接口上传，服务重启后自动替换。</p>
+<form id="bk" onsubmit="return false">
+  <input id="token" placeholder="备份令牌 ADMIN_BACKUP_TOKEN" style="padding:8px;width:280px">
+  <button id="dl" style="padding:8px 16px">下载备份</button>
+</form>
+<p style="color:#666;font-size:13px">恢复接口：POST /admin/restore?token=你的令牌，body 为 SQLite 文件二进制；成功后服务自动重启并用上传的库替换当前库。</p>
+
+<h2>接口一览</h2>
+<p style="color:#666;font-size:13px">POST /actions，body {"action":"接口名","args":{...}}，返回 {"data":...} 或 {"error":"..."}。债务人端公开接口：getHomepageContent、getSystemName、verifyIdentity、recordLinkClick、getAuthStatus、login、setupPasswords、getSession；其余接口需在 args 里带 sessionToken（先调 login 拿）。案件管理另见接口：listCases、getCase、createCase、importCases、updateCase、deleteCase、getStats。</p>
+
+<script>
+fetch('/health').then(function(r){ return r.json(); }).then(function(j){
+  document.getElementById('health').textContent = j.ok ? '正常' : '异常';
+}).catch(function(){ document.getElementById('health').textContent = '不可达'; });
+document.getElementById('f').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var fd = new FormData(e.target);
+  var r = await fetch('/api/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idCard: fd.get('idCard'), phone: fd.get('phone') }) });
+  document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+});
+document.getElementById('dl').addEventListener('click', function(){
+  var t = document.getElementById('token').value.trim();
+  if(!t){ alert('先填备份令牌'); return; }
+  window.location.href = '/admin/backup?token=' + encodeURIComponent(t);
+});
+</script>
+</body></html>
