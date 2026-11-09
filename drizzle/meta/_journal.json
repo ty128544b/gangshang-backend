@@ -113,6 +113,13 @@
       "when": 1794222946174,
       "tag": "0016_add_muted_at_and_muted_source_to_cases",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1794225161355,
+      "tag": "0017_add_operators_assignees_and_actors",
+      "breakpoints": true
     }
   ]
 }

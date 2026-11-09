@@ -22,6 +22,12 @@ export const cases = sqliteTable("cases", {
   // sendDebtorMessage 直接拒绝）。禁言只能由管理员手动设置/解除，
   // 没有自动禁言；刷屏由发送限流挡（超限返回限流文案）。
   mutedAt: integer("muted_at", { mode: "timestamp_ms" }),
+  // 执行禁言的经手人显示名（管理员 / 操作员显示名），解除禁言时清空。
+  mutedBy: text("muted_by").notNull().default(""),
+  // 分案负责人（操作员 id）：null = 未分配。普通操作员只能看到分给
+  // 自己的案件（未分配的也看不到）；管理员与有分案权限的操作员
+  // （分案主管）看全部。分派只能由管理员或分案主管手动指定/改派。
+  assigneeId: integer("assignee_id"),
   status: text("status", { enum: ["draft", "sent"] })
     .notNull()
     .default("draft"),
@@ -68,6 +74,9 @@ export const chatMessages = sqliteTable("chat_messages", {
     .default("debtor"),
   text: text("text").notNull(),
   analysis: text("analysis").notNull().default(""),
+  // 经手人显示名：我方（agent）消息记发送它的管理员/操作员显示名，
+  // 债务人与系统消息为空。后台聊天里据此显示「这句话是谁发的」。
+  actorName: text("actor_name").notNull().default(""),
   // 客服（我方）随消息发送的图片在 blobs 里的键；无图消息为 null。
   imageBlobKey: text("image_blob_key"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
@@ -83,6 +92,8 @@ export const agreements = sqliteTable("agreements", {
     .default("installment"),
   detail: text("detail").notNull().default(""),
   amountCents: integer("amount_cents").notNull().default(0),
+  // 经手人显示名：登记这条协商事项的管理员/操作员显示名。
+  createdBy: text("created_by").notNull().default(""),
   status: text("status", { enum: ["active", "done", "void"] })
     .notNull()
     .default("active"),
@@ -97,6 +108,9 @@ export const payments = sqliteTable("payments", {
   amountCents: integer("amount_cents").notNull().default(0),
   paidOn: text("paid_on").notNull().default(""),
   note: text("note").notNull().default(""),
+  // 经手人显示名：后台登记记登记人显示名；债务人自助上传截图记
+  // 「债务人自助提交」。
+  recordedBy: text("recorded_by").notNull().default(""),
   screenshotBlobKey: text("screenshot_blob_key"),
   reconcileStatus: text("reconcile_status", {
     enum: ["pending", "matched", "mismatch"],
@@ -274,6 +288,34 @@ export const authCredentials = sqliteTable("auth_credentials", {
   adminLockedUntil: integer("admin_locked_until").notNull().default(0),
   userFailCount: integer("user_fail_count").notNull().default(0),
   userLockedUntil: integer("user_locked_until").notNull().default(0),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/* ---------------- 操作员账号（多用户登录） ---------------- */
+
+// 后台操作员：管理员建号、设用户名与密码，每人一个账号各自登录。
+// permissions 是 JSON 数组字符串，存该操作员被授予的权限键（见
+// actions.ts 的 PERMISSION_DEFS）：业务权限默认全开，管理员可在
+// 「权限管理」里按人按项回收；含 "assign"（分案）即分案主管——
+// 操作员全部权限 + 分案/改派 + 看全部案件，但不管账号与权限开关。
+// 登录防爆破与管理员/旧用户账号同口径：连错 5 次锁 15 分钟，计数与
+// 锁定截止存本行。现有的单用户账号平滑过渡：首次需要时用
+// auth_credentials.user_hash 作种子生成用户名为 user 的操作员行，
+// 原密码继续能登录（见 actions.ts 的 ensureOperatorSeed）。
+export const operators = sqliteTable("operators", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  username: text("username").notNull().default(""),
+  displayName: text("display_name").notNull().default(""),
+  passwordHash: text("password_hash").notNull().default(""),
+  permissions: text("permissions").notNull().default("[]"),
+  disabled: integer("disabled").notNull().default(0),
+  failCount: integer("fail_count").notNull().default(0),
+  lockedUntil: integer("locked_until").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

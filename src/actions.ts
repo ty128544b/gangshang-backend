@@ -6,7 +6,7 @@ import {
   type Ctx,
   type SpaceDb,
 } from "./shim";
-import { asc, desc, eq, gt, lt, sql } from "drizzle-orm";
+import { asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 const caseFields = {
@@ -40,6 +40,9 @@ const caseOut = z.object({
   humanNote: z.string(),
   humanTakeover: z.boolean(),
   muted: z.boolean(),
+  mutedBy: z.string(),
+  assigneeId: z.number().nullable(),
+  assigneeName: z.string(),
   chatCount: z.number(),
   pendingPayments: z.number(),
   status: z.enum(["draft", "sent"]),
@@ -80,6 +83,7 @@ const chatMessageOut = z.object({
   sender: z.enum(["debtor", "agent", "system"]),
   text: z.string(),
   analysis: z.string(),
+  actorName: z.string(),
   hasImage: z.boolean(),
   imageUrl: z.string(),
   createdAt: z.string(),
@@ -101,6 +105,7 @@ const agreementOut = z.object({
   kind: z.enum(["installment", "waiver", "settlement"]),
   detail: z.string(),
   amountCents: z.number(),
+  createdBy: z.string(),
   status: z.enum(["active", "done", "void"]),
   createdAt: z.string(),
 });
@@ -111,6 +116,7 @@ const paymentOut = z.object({
   amountCents: z.number(),
   paidOn: z.string(),
   note: z.string(),
+  recordedBy: z.string(),
   hasScreenshot: z.boolean(),
   reconcileStatus: z.enum(["pending", "matched", "mismatch"]),
   createdAt: z.string(),
@@ -891,6 +897,7 @@ function toCaseOut(
   chatCount = 0,
   pendingPayments = 0,
   extra?: { willingness: Willingness; clicks: ClickAgg },
+  assigneeName = "",
 ): z.infer<typeof caseOut> {
   return {
     id: row.id,
@@ -909,6 +916,9 @@ function toCaseOut(
     humanNote: row.humanNote,
     humanTakeover: row.humanTakeoverAt != null,
     muted: row.mutedAt != null,
+    mutedBy: row.mutedAt != null ? (row.mutedBy ?? "") : "",
+    assigneeId: row.assigneeId ?? null,
+    assigneeName,
     chatCount,
     pendingPayments,
     status: row.status,
@@ -1164,10 +1174,113 @@ function loginLocationText(loc: {
   return parts.join(" ");
 }
 
+/* ---------------- 服务端 IP 归属地解析（v16） ----------------
+   债务人登录地点不再由前端查、随请求带入（不可信且已被审计指出），
+   改由服务端按核验请求的真实 IP 解析：IP 由可信 HTTP 分发层从请求头
+   取（X-Forwarded-For 第一跳，无则 X-Real-IP）后经 verifyIdentity 的
+   内部字段 clientIp 注入。解析异步进行：登录记录先落行，解析出结果
+   后回填 country/province/city，不阻塞核验响应。私网/保留地址不查，
+   查不到或服务不可用时地点留空，都不影响登录本身。 */
+
+function isPublicIp(ip: string): boolean {
+  const t = ip.trim();
+  if (!t) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(t)) {
+    const parts = t.split(".").map(Number);
+    const [a = 0, b = 0] = parts;
+    if (a === 10 || a === 127 || a === 0) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false;
+    return true;
+  }
+  const lower = t.toLowerCase();
+  if (lower === "::1" || lower.startsWith("fe80:") || lower.startsWith("fc") || lower.startsWith("fd")) {
+    return false;
+  }
+  return t.includes(":");
+}
+
+async function lookupIpLocation(
+  ip: string,
+): Promise<{ country: string; province: string; city: string } | null> {
+  // 主：ipwho.is（与原前端解析同一服务，字段口径一致）；备：ipapi.co。
+  try {
+    const res = await fetch(
+      `https://ipwho.is/${encodeURIComponent(ip)}?lang=zh-CN`,
+      { signal: AbortSignal.timeout(3000) },
+    );
+    if (res.ok) {
+      const data = (await res.json()) as Record<string, unknown>;
+      if (data && data.success !== false) {
+        const country = normalizeCountry(
+          typeof data.country === "string" ? data.country : "",
+        );
+        const province = normalizeProvince(
+          typeof data.region === "string" ? data.region : "",
+        );
+        const city =
+          typeof data.city === "string" ? data.city.trim() : "";
+        if (country || province || city) return { country, province, city };
+      }
+    }
+  } catch {
+    /* 主服务不可用时走备用 */
+  }
+  try {
+    const res = await fetch(
+      `https://ipapi.co/${encodeURIComponent(ip)}/json/`,
+      { signal: AbortSignal.timeout(3000) },
+    );
+    if (res.ok) {
+      const data = (await res.json()) as Record<string, unknown>;
+      const country = normalizeCountry(
+        typeof data?.country_name === "string" ? data.country_name : "",
+      );
+      const province = normalizeProvince(
+        typeof data?.region === "string" ? data.region : "",
+      );
+      const city = typeof data?.city === "string" ? data.city.trim() : "";
+      if (country || province || city) return { country, province, city };
+    }
+  } catch {
+    /* 备用也不可用：地点留空 */
+  }
+  return null;
+}
+
+// 后台任务：解析 IP 归属地并回填到指定的登录记录行。失败静默（地点
+// 留空即可），绝不让解析问题影响已经完成的核验。
+async function resolveAndStoreLoginLocation(
+  ctx: Ctx,
+  loginId: number,
+  ip: string,
+): Promise<void> {
+  try {
+    if (!isPublicIp(ip)) return;
+    const loc = await lookupIpLocation(ip);
+    if (!loc) return;
+    const db = ctx.db<typeof schema>();
+    await db
+      .update(schema.debtorLogins)
+      .set({
+        country: loc.country,
+        province: loc.province,
+        city: loc.city,
+      })
+      .where(eq(schema.debtorLogins.id, loginId));
+  } catch {
+    /* 地点只是附加信息，解析失败不留痕也不报错 */
+  }
+}
+
 const loginOut = z.object({
   ok: z.boolean(),
   token: z.string().nullable(),
   role: z.enum(["admin", "user"]).nullable(),
+  username: z.string(),
+  displayName: z.string(),
   error: z.string(),
 });
 
@@ -1184,6 +1297,8 @@ const chatInboxItemOut = z.object({
   humanTakeover: z.boolean(),
   needsHuman: z.boolean(),
   muted: z.boolean(),
+  assigneeId: z.number().nullable(),
+  assigneeName: z.string(),
   lastMessageId: z.number(),
   lastSender: z.enum(["debtor", "agent", "system"]),
   lastText: z.string(),
@@ -1202,9 +1317,11 @@ const pendingPaymentItemOut = z.object({
   caseId: z.number(),
   debtorName: z.string(),
   caseNo: z.string(),
+  assigneeId: z.number().nullable(),
   amountCents: z.number(),
   paidOn: z.string(),
   note: z.string(),
+  recordedBy: z.string(),
   createdAt: z.string(),
   hasScreenshot: z.boolean(),
   screenshotUrl: z.string(),
@@ -1275,6 +1392,418 @@ async function runDebtorMessageAnalysis(
   return analysis;
 }
 
+/* ---------------- 多用户会话、权限与案件可见范围 ----------------
+   v16：后台从「管理员 + 一个用户账号」升级为「管理员 + 多个操作员」。
+   管理员管账号密码、权限开关与网页维护；日常催收（聊天、接管、禁言、
+   登记还款等）归操作员账号，每人一个用户名密码，各自登录，权限按人
+   开关（默认全开，管理员可回收）。案件带负责人（分案）：普通操作员
+   只能看到分给自己的案件，未分配的也看不到——服务端强制过滤，调
+   别人案件的接口直接 403；含「分案」权限的操作员即分案主管，与
+   管理员一样看全部案件、能分案改派，但不管账号与权限开关。
+
+   会话对象由权限守卫在调用业务 handler 前解析好放进 sessionStore，
+   handler 里用 currentSession(ctx) 取。管理员会话的 operatorId 为
+   null；操作员会话带其账号 id、用户名、显示名与权限集合。 */
+
+const PERMISSION_DEFS = [
+  { key: "chat", label: "发聊天" },
+  { key: "analysis", label: "分析" },
+  { key: "agreement", label: "协议" },
+  { key: "payment", label: "登记 / 对账还款" },
+  { key: "takeover", label: "接管" },
+  { key: "mute", label: "禁言" },
+  { key: "cases", label: "案件" },
+  { key: "content", label: "内容" },
+  { key: "scripts", label: "话术" },
+  { key: "assign", label: "分案（分案主管）" },
+] as const;
+
+type PermissionKey = (typeof PERMISSION_DEFS)[number]["key"];
+
+const PERMISSION_KEYS: ReadonlySet<string> = new Set(
+  PERMISSION_DEFS.map((d) => d.key),
+);
+
+// 新建操作员的默认权限：业务权限全开；「分案」默认不开——授予哪个
+// 操作员，哪个就是分案主管，属于管理员的刻意授权。
+const DEFAULT_OPERATOR_PERMISSIONS: PermissionKey[] = [
+  "chat",
+  "analysis",
+  "agreement",
+  "payment",
+  "takeover",
+  "mute",
+  "cases",
+  "content",
+  "scripts",
+];
+
+type Session = {
+  role: "admin" | "user";
+  operatorId: number | null;
+  username: string;
+  displayName: string;
+  permissions: ReadonlySet<string>;
+  // 看全部案件：管理员，或有分案权限的操作员（分案主管）。
+  scopeAll: boolean;
+  canAssign: boolean;
+};
+
+const sessionStore = new WeakMap<object, Session>();
+
+function currentSession(ctx: Ctx): Session | null {
+  return sessionStore.get(ctx) ?? null;
+}
+
+// 经手人显示名：聊天发送、禁言、登记还款等操作落库时记这个名字。
+function sessionActorName(session: Session | null): string {
+  if (!session) return "";
+  if (session.role === "admin") return "管理员";
+  return session.displayName || session.username;
+}
+
+function parsePermissions(raw: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(raw || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (p): p is string => typeof p === "string" && PERMISSION_KEYS.has(p),
+    );
+  } catch {
+    return [];
+  }
+}
+
+type OperatorRow = typeof schema.operators.$inferSelect;
+
+async function loadOperators(ctx: Ctx): Promise<OperatorRow[]> {
+  const db = ctx.db<typeof schema>();
+  return db
+    .select()
+    .from(schema.operators)
+    .orderBy(asc(schema.operators.id));
+}
+
+/* 平滑过渡：operators 表为空、且旧的单用户密码已经设置过时，用旧
+   用户密码哈希作种子生成第一个操作员账号（用户名 user、显示名
+   「用户」），原密码继续能登录。已生成过就不再重复生成。 */
+async function ensureOperatorSeed(ctx: Ctx): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const existing = await db
+    .select({ id: schema.operators.id })
+    .from(schema.operators)
+    .limit(1);
+  if (existing.length > 0) return;
+  const cred = await loadCredentials(ctx);
+  if (!cred || !cred.userHash) return;
+  await db.insert(schema.operators).values({
+    username: "user",
+    displayName: "用户",
+    passwordHash: cred.userHash,
+    permissions: JSON.stringify(DEFAULT_OPERATOR_PERMISSIONS),
+    disabled: 0,
+  });
+}
+
+async function loadAssigneeNames(
+  ctx: Ctx,
+): Promise<Map<number, string>> {
+  const ops = await loadOperators(ctx);
+  return new Map(
+    ops.map((o) => [o.id, o.displayName || o.username] as const),
+  );
+}
+
+/* 当前会话能看的案件 id 集合：null = 全部可见（管理员 / 分案主管）；
+   普通操作员只能看分给自己的案件（未分配的 assigneeId 为 null，
+   不在集合里，天然不可见）。 */
+async function visibleCaseIds(ctx: Ctx): Promise<Set<number> | null> {
+  const session = currentSession(ctx);
+  if (!session || session.scopeAll) return null;
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select({ id: schema.cases.id })
+    .from(schema.cases)
+    .where(eq(schema.cases.assigneeId, session.operatorId ?? -1));
+  return new Set(rows.map((r) => r.id));
+}
+
+/* 单案件接口的服务端强制范围校验：普通操作员调不属于自己的案件
+   直接拒绝（文案含「只认管理员」标记，生产分发层据此定 403）。 */
+async function assertCaseVisible(ctx: Ctx, caseId: number): Promise<void> {
+  const visible = await visibleCaseIds(ctx);
+  if (visible && !visible.has(caseId)) {
+    throw new Error(SCOPE_DENIED_MESSAGE);
+  }
+}
+
+/* 操作员回款能力分析一行：以该操作员负责的案件为范围，数字来自案件
+   台账与已确认回款；沟通信号来自其名下案件的聊天记录（回复及时性、
+   高意愿未跟进、拖延信号抓取）；建议由服务端按规则生成。普通操作员
+   只看得到自己这一行（服务端过滤），管理员与分案主管看全部。 */
+const operatorPerfOut = z.object({
+  operatorId: z.number(),
+  username: z.string(),
+  displayName: z.string(),
+  disabled: z.boolean(),
+  isSupervisor: z.boolean(),
+  caseCount: z.number(),
+  totalDueCents: z.number(),
+  repaidCents: z.number(),
+  recoveryRate: z.number(),
+  avgRepayDays: z.number().nullable(),
+  highUnpaidCount: z.number(),
+  debtorMessageCount: z.number(),
+  agentMessageCount: z.number(),
+  avgReplyHours: z.number().nullable(),
+  highUnfollowedCount: z.number(),
+  delaySignalTotal: z.number(),
+  delaySignalCaught: z.number(),
+  suggestions: z.array(z.string()),
+});
+
+// 债务人拖延信号：与话术规则同口径的时间模糊/推迟表述。
+const DELAY_SIGNAL_RE =
+  /下个月|下周|下星期|过几天|过两天|过段时间|过阵子|发工资|工资发|等钱到|到账再|考虑|想想|缓缓|再等等|等几天|忙完这阵/;
+
+async function computeOperatorPerformance(
+  ctx: Ctx,
+): Promise<z.infer<typeof operatorPerfOut>[]> {
+  const db = ctx.db<typeof schema>();
+  const session = currentSession(ctx);
+  const ops = await loadOperators(ctx);
+  const caseRows = await db.select().from(schema.cases);
+  const payRows = await db.select().from(schema.payments);
+  const agreementRows = await db.select().from(schema.agreements);
+  const chatRows = await db
+    .select()
+    .from(schema.chatMessages)
+    .orderBy(asc(schema.chatMessages.id));
+
+  const matchedByCase = new Map<number, number>();
+  const firstMatchedAtByCase = new Map<number, Date>();
+  for (const p of payRows) {
+    if (p.reconcileStatus !== "matched") continue;
+    matchedByCase.set(
+      p.caseId,
+      (matchedByCase.get(p.caseId) ?? 0) + p.amountCents,
+    );
+    const prev = firstMatchedAtByCase.get(p.caseId);
+    if (!prev || p.createdAt < prev) firstMatchedAtByCase.set(p.caseId, p.createdAt);
+  }
+  const willingnessByCase = new Map<number, Willingness>();
+  for (const r of caseRows) {
+    const debtorChats = chatRows.filter(
+      (m) => m.caseId === r.id && m.sender === "debtor",
+    );
+    willingnessByCase.set(
+      r.id,
+      computeWillingness({
+        totalDueCents: r.totalDueCents,
+        matchedRepaidCents: matchedByCase.get(r.id) ?? 0,
+        debtorAnalysesAsc: debtorChats.map((m) => m.analysis),
+        debtorMessageCount: debtorChats.length,
+        hasActiveAgreement: agreementRows.some(
+          (a) => a.caseId === r.id && a.status === "active",
+        ),
+        hasDoneAgreement: agreementRows.some(
+          (a) => a.caseId === r.id && a.status === "done",
+        ),
+      }),
+    );
+  }
+
+  type Raw = {
+    op: OperatorRow;
+    caseCount: number;
+    totalDueCents: number;
+    repaidCents: number;
+    recoveryRate: number;
+    avgRepayDays: number | null;
+    highUnpaidCount: number;
+    debtorMessageCount: number;
+    agentMessageCount: number;
+    avgReplyHours: number | null;
+    highUnfollowedCount: number;
+    delaySignalTotal: number;
+    delaySignalCaught: number;
+  };
+  const raws: Raw[] = [];
+  for (const op of ops) {
+    const myCases = caseRows.filter((r) => r.assigneeId === op.id);
+    const myCaseIds = new Set(myCases.map((r) => r.id));
+    const totalDueCents = myCases.reduce((s, r) => s + r.totalDueCents, 0);
+    const repaidCents = myCases.reduce(
+      (s, r) => s + (matchedByCase.get(r.id) ?? 0),
+      0,
+    );
+    // 平均回款天数：有已确认回款的案件，案件建档到第一笔确认回款的天数均值。
+    const repayDaySamples: number[] = [];
+    for (const r of myCases) {
+      const first = firstMatchedAtByCase.get(r.id);
+      if (first) {
+        repayDaySamples.push(
+          Math.max(
+            0,
+            (first.getTime() - r.createdAt.getTime()) / 86_400_000,
+          ),
+        );
+      }
+    }
+    const myChats = chatRows.filter((m) => myCaseIds.has(m.caseId));
+    const debtorMsgs = myChats.filter((m) => m.sender === "debtor");
+    const agentMsgs = myChats.filter((m) => m.sender === "agent");
+    // 回复及时性：每条债务人消息之后第一条我方消息与它的时间差（小时）均值。
+    const replyHours: number[] = [];
+    const byCase = new Map<number, typeof myChats>();
+    for (const m of myChats) {
+      const arr = byCase.get(m.caseId) ?? [];
+      arr.push(m);
+      byCase.set(m.caseId, arr);
+    }
+    let highUnfollowedCount = 0;
+    for (const r of myCases) {
+      const msgs = byCase.get(r.id) ?? [];
+      let pendingSince: Date | null = null;
+      for (const m of msgs) {
+        if (m.sender === "debtor") {
+          if (!pendingSince) pendingSince = m.createdAt;
+        } else if (m.sender === "agent" && pendingSince) {
+          replyHours.push(
+            (m.createdAt.getTime() - pendingSince.getTime()) / 3_600_000,
+          );
+          pendingSince = null;
+        }
+      }
+      const w = willingnessByCase.get(r.id) ?? "low";
+      const repaid = matchedByCase.get(r.id) ?? 0;
+      if (
+        w === "high" &&
+        r.totalDueCents > 0 &&
+        repaid < r.totalDueCents &&
+        pendingSince !== null
+      ) {
+        highUnfollowedCount += 1;
+      }
+    }
+    let delaySignalTotal = 0;
+    let delaySignalCaught = 0;
+    for (const m of debtorMsgs) {
+      if (!DELAY_SIGNAL_RE.test(m.text)) continue;
+      delaySignalTotal += 1;
+      const caught = myChats.some(
+        (a) => a.caseId === m.caseId && a.sender === "agent" && a.id > m.id,
+      );
+      if (caught) delaySignalCaught += 1;
+    }
+    raws.push({
+      op,
+      caseCount: myCases.length,
+      totalDueCents,
+      repaidCents,
+      recoveryRate: totalDueCents > 0 ? repaidCents / totalDueCents : 0,
+      avgRepayDays:
+        repayDaySamples.length > 0
+          ? Math.round(
+              (repayDaySamples.reduce((s, v) => s + v, 0) /
+                repayDaySamples.length) *
+                10,
+            ) / 10
+          : null,
+      highUnpaidCount: myCases.filter((r) => {
+        const w = willingnessByCase.get(r.id) ?? "low";
+        const repaid = matchedByCase.get(r.id) ?? 0;
+        return w === "high" && r.totalDueCents > 0 && repaid < r.totalDueCents;
+      }).length,
+      debtorMessageCount: debtorMsgs.length,
+      agentMessageCount: agentMsgs.length,
+      avgReplyHours:
+        replyHours.length > 0
+          ? Math.round(
+              (replyHours.reduce((s, v) => s + v, 0) / replyHours.length) *
+                10,
+            ) / 10
+          : null,
+      highUnfollowedCount,
+      delaySignalTotal,
+      delaySignalCaught,
+    });
+  }
+
+  const withCases = raws.filter((r) => r.caseCount > 0);
+  const teamAvgRate =
+    withCases.length > 0
+      ? withCases.reduce((s, r) => s + r.recoveryRate, 0) / withCases.length
+      : 0;
+  const maxCaseCount = Math.max(0, ...raws.map((r) => r.caseCount));
+  const avgCaseCount =
+    withCases.length > 0
+      ? withCases.reduce((s, r) => s + r.caseCount, 0) / withCases.length
+      : 0;
+
+  const rows = raws.map((r) => {
+    const suggestions: string[] = [];
+    if (r.caseCount > 0 && r.recoveryRate < teamAvgRate) {
+      suggestions.push(
+        `回款率 ${(r.recoveryRate * 100).toFixed(1)}% 低于团队平均 ${(teamAvgRate * 100).toFixed(1)}%，建议优先跟进名下的高意愿名单，先把有意愿的转成回款。`,
+      );
+    }
+    if (
+      r.caseCount > 0 &&
+      r.caseCount === maxCaseCount &&
+      r.caseCount > avgCaseCount
+    ) {
+      suggestions.push(
+        `手头 ${r.caseCount} 个案件是团队最多，积压风险高，建议请分案主管分流一部分案件，避免跟进不过来。`,
+      );
+    }
+    if (r.highUnfollowedCount > 0) {
+      suggestions.push(
+        `有 ${r.highUnfollowedCount} 个高意愿债务人发来消息后还没跟进回复，建议立即跟进，别让意愿凉下来。`,
+      );
+    }
+    if (r.delaySignalTotal > r.delaySignalCaught) {
+      suggestions.push(
+        `债务人的拖延信号共 ${r.delaySignalTotal} 次，其中 ${r.delaySignalTotal - r.delaySignalCaught} 次没有接住，建议回复时按话术当场锁定具体日期与定金，不给模糊拖延留口子。`,
+      );
+    }
+    if (r.avgReplyHours !== null && r.avgReplyHours > 24) {
+      suggestions.push(
+        `回复不够及时：债务人消息平均 ${r.avgReplyHours} 小时才得到回复，建议压到当天内，意愿热的时候回得越快越容易成交。`,
+      );
+    }
+    if (suggestions.length === 0) {
+      suggestions.push("表现稳定，各项指标正常，继续保持。");
+    }
+    return {
+      operatorId: r.op.id,
+      username: r.op.username,
+      displayName: r.op.displayName || r.op.username,
+      disabled: r.op.disabled === 1,
+      isSupervisor: parsePermissions(r.op.permissions).includes("assign"),
+      caseCount: r.caseCount,
+      totalDueCents: r.totalDueCents,
+      repaidCents: r.repaidCents,
+      recoveryRate: r.recoveryRate,
+      avgRepayDays: r.avgRepayDays,
+      highUnpaidCount: r.highUnpaidCount,
+      debtorMessageCount: r.debtorMessageCount,
+      agentMessageCount: r.agentMessageCount,
+      avgReplyHours: r.avgReplyHours,
+      highUnfollowedCount: r.highUnfollowedCount,
+      delaySignalTotal: r.delaySignalTotal,
+      delaySignalCaught: r.delaySignalCaught,
+      suggestions,
+    };
+  });
+
+  // 普通操作员只看自己一行；管理员与分案主管看全部。
+  if (session && !session.scopeAll && session.operatorId != null) {
+    return rows.filter((r) => r.operatorId === session.operatorId);
+  }
+  return rows;
+}
+
 const baseActions = {
   listCases: defineAction({
     description: "列出全部债务人案件（含进度完成数与发送次数）及汇总数据。",
@@ -1288,10 +1817,17 @@ const baseActions = {
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const rows = await db
+      const allRows = await db
         .select()
         .from(schema.cases)
         .orderBy(desc(schema.cases.updatedAt));
+      // 分案可见范围（服务端强制）：普通操作员只看分给自己的案件，
+      // 汇总数字也只算他名下的；管理员与分案主管看全部。
+      const visible = await visibleCaseIds(ctx);
+      const rows = visible
+        ? allRows.filter((r) => visible.has(r.id))
+        : allRows;
+      const assigneeNames = await loadAssigneeNames(ctx);
       const steps = await db.select().from(schema.progressSteps);
       const sends = await db.select().from(schema.sendRecords);
       const chats = await db.select().from(schema.chatMessages);
@@ -1341,6 +1877,9 @@ const baseActions = {
               }),
               clicks: clickAgg.get(r.id) ?? { count: 0, firstAt: null, lastAt: null },
             },
+            r.assigneeId != null
+              ? (assigneeNames.get(r.assigneeId) ?? "")
+              : "",
           );
         }),
         totalCases: rows.length,
@@ -1358,7 +1897,14 @@ const baseActions = {
     response: z.object({ items: z.array(chatInboxItemOut) }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.cases);
+      const allCases = await db.select().from(schema.cases);
+      // 分案可见范围（服务端强制）：普通操作员的收件箱只有自己名下的
+      // 案件，新消息提示音也只会为这些案件响；管理员与分案主管看全部。
+      const visible = await visibleCaseIds(ctx);
+      const rows = visible
+        ? allCases.filter((r) => visible.has(r.id))
+        : allCases;
+      const assigneeNames = await loadAssigneeNames(ctx);
       const chats = await db
         .select()
         .from(schema.chatMessages)
@@ -1397,6 +1943,11 @@ const baseActions = {
           humanTakeover: r.humanTakeoverAt != null,
           needsHuman: r.needsHuman === 1,
           muted: r.mutedAt != null,
+          assigneeId: r.assigneeId ?? null,
+          assigneeName:
+            r.assigneeId != null
+              ? (assigneeNames.get(r.assigneeId) ?? "")
+              : "",
           lastMessageId: last.id,
           lastSender: last.sender,
           lastText: last.text,
@@ -1425,7 +1976,13 @@ const baseActions = {
         .from(schema.payments)
         .where(eq(schema.payments.reconcileStatus, "pending"))
         .orderBy(desc(schema.payments.id));
-      const caseRows = await db.select().from(schema.cases);
+      const caseRowsAll = await db.select().from(schema.cases);
+      // 分案可见范围（服务端强制）：普通操作员只看自己名下案件的待确认
+      // 回款，导航角标与第三种提示音也只针对这些；管理员与分案主管看全部。
+      const visible = await visibleCaseIds(ctx);
+      const caseRows = visible
+        ? caseRowsAll.filter((c) => visible.has(c.id))
+        : caseRowsAll;
       const caseById = new Map(caseRows.map((c) => [c.id, c]));
       const items: z.infer<typeof pendingPaymentItemOut>[] = [];
       for (const p of pays) {
@@ -1436,9 +1993,11 @@ const baseActions = {
           caseId: p.caseId,
           debtorName: c.debtorName,
           caseNo: c.caseNo,
+          assigneeId: c.assigneeId ?? null,
           amountCents: p.amountCents,
           paidOn: p.paidOn,
           note: p.note,
+          recordedBy: p.recordedBy ?? "",
           createdAt: p.createdAt.toISOString(),
           hasScreenshot: p.screenshotBlobKey != null,
           screenshotUrl: p.screenshotBlobKey
@@ -1542,15 +2101,32 @@ const baseActions = {
           actionPlan: z.string(),
         }),
       ),
+      operatorPerformance: z.array(operatorPerfOut),
     }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
-      const caseRows = await db.select().from(schema.cases);
-      const payRows = await db.select().from(schema.payments);
+      const allCaseRows = await db.select().from(schema.cases);
+      const allPayRows = await db.select().from(schema.payments);
+      const allClickRows = await db.select().from(schema.linkClicks);
+      // 分案可见范围（服务端强制）：普通操作员的统计与名单只算自己
+      // 名下的案件（总览、趋势、分布、名单全部按负责人过滤）；管理员
+      // 与分案主管看全部。
+      const visible = await visibleCaseIds(ctx);
+      const caseRows = visible
+        ? allCaseRows.filter((r) => visible.has(r.id))
+        : allCaseRows;
+      const payRows = visible
+        ? allPayRows.filter((p) => visible.has(p.caseId))
+        : allPayRows;
+      const clickRows = visible
+        ? allClickRows.filter((c) => visible.has(c.caseId))
+        : allClickRows;
       const agreementRows = await db.select().from(schema.agreements);
       const chatRows = await db.select().from(schema.chatMessages);
-      const clickRows = await db.select().from(schema.linkClicks);
-      const loginRows = await db.select().from(schema.debtorLogins);
+      const loginRowsAll = await db.select().from(schema.debtorLogins);
+      const loginRows = visible
+        ? loginRowsAll.filter((l) => visible.has(l.caseId))
+        : loginRowsAll;
 
       const matchedByCase = new Map<number, number>();
       let repaidCents = 0;
@@ -2003,6 +2579,7 @@ const baseActions = {
         ageBrackets,
         ageUnknownCount,
         willingList,
+        operatorPerformance: await computeOperatorPerformance(ctx),
       };
     },
   }),
@@ -2031,13 +2608,18 @@ const baseActions = {
 
   verifyIdentity: defineAction({
     description:
-      "债务人登录身份核验：以身份证号为查找键匹配案件记录，手机号必填（填现用手机号即可，不要求与台账一致；债务人换了手机号，只要身份证号与案件记录一致即可认出其案件）。身份证号未命中时不返回任何案件信息。防爆破：同一身份证号或同一手机号 10 分钟内最多核验 20 次，超限直接拒绝并提示稍后再试。核验成功时记一条该案件的登录记录（debtor_logins）：保存本次登录填写的手机号（与台账手机号不一致也照记，两个都保留），以及债务人网页按本次登录请求 IP 解析出的地理位置（loginCountry/loginProvince/loginCity，国家/省/市，可空——网页静默解析、不要求债务人授权定位，解析不到就不带，核验流程不受影响），供后台名单展示登录地点并与台账地区比对。",
+      "债务人登录身份核验：以身份证号为查找键匹配案件记录，手机号必填（填现用手机号即可，不要求与台账一致；债务人换了手机号，只要身份证号与案件记录一致即可认出其案件）。身份证号未命中时不返回任何案件信息。防爆破：同一身份证号或同一手机号 10 分钟内最多核验 20 次，超限直接拒绝并提示稍后再试。核验成功时记一条该案件的登录记录（debtor_logins）：保存本次登录填写的手机号（与台账手机号不一致也照记，两个都保留）。登录地点改服务端解析（v16）：不再信任客户端传来的定位字段（loginCountry/loginProvince/loginCity 仅为兼容旧客户端保留、服务端一律忽略）；地点由服务端按本次请求的真实 IP 解析——IP 由可信 HTTP 分发层从请求头 X-Forwarded-For 第一跳（无则 X-Real-IP）取到后经内部字段 clientIp 注入，债务人网页自己不传、也改不了；服务端拿到 IP 后异步查归属地回填登录记录（解析在后台进行，不等结果、不拖慢登录），没有 IP、私网 IP 或查不到时地点留空，不影响核验本身。登录省份与台账地区（身份证省份）不一致的标记口径不变（getStats 里比对）。",
     request: z.object({
       idCard: z.string().min(1, "身份证号不能为空"),
       phone: z.string().trim().min(1, "请填写手机号"),
+      // 旧客户端曾带入的定位字段：仅为兼容保留，服务端不再采用。
       loginCountry: z.string().default(""),
       loginProvince: z.string().default(""),
       loginCity: z.string().default(""),
+      // 本次请求的真实 IP：只能由可信 HTTP 分发层按请求头注入
+      // （X-Forwarded-For 第一跳，无则 X-Real-IP）；动作层拿不到请求头，
+      // 债务人网页不传此字段。为空时地点留空，核验照常进行。
+      clientIp: z.string().default(""),
     }),
     response: z.object({
       found: z.boolean(),
@@ -2049,13 +2631,23 @@ const baseActions = {
       const db = ctx.db<typeof schema>();
       const idCardNorm = args.idCard.trim().toUpperCase();
       const phoneNorm = args.phone.trim();
-      // 本次登录按请求 IP 解析出的地理位置（网页带入，可能为空）：归一化后随登录记录落库。
-      const loginLoc = {
-        country: normalizeCountry(args.loginCountry ?? ""),
-        province: normalizeProvince(args.loginProvince ?? ""),
-        city: (args.loginCity ?? "").trim(),
+      // 登录地点改服务端解析：客户端传来的定位字段一律不采用；只认
+      // 可信分发层注入的 clientIp（请求真实 IP）。分发层一般已取
+      // X-Forwarded-For 第一跳，这里再防御性地截一次逗号前第一段。
+      const clientIp = (args.clientIp ?? "").split(",")[0]?.trim() ?? "";
+      // 记一次登录：先按手机号落行、地点留空，IP 归属地在后台异步
+      // 解析后回填这一行，核验响应不等解析结果（不拖慢登录）。
+      const recordLogin = async (caseId: number): Promise<void> => {
+        if (!phoneNorm && !clientIp) return;
+        const insertedLogin = await db
+          .insert(schema.debtorLogins)
+          .values({ caseId, phone: phoneNorm })
+          .returning({ id: schema.debtorLogins.id });
+        const loginId = insertedLogin[0]?.id;
+        if (loginId && clientIp) {
+          void resolveAndStoreLoginLocation(ctx, loginId, clientIp);
+        }
       };
-      const hasLoginLoc = !!(loginLoc.country || loginLoc.province || loginLoc.city);
       if (!idCardNorm) {
         return { found: false, matchedByIdCard: false, phoneChanged: false, case: null };
       }
@@ -2075,15 +2667,9 @@ const baseActions = {
         if (!fallback) {
           return { found: false, matchedByIdCard: false, phoneChanged: false, case: null };
         }
-        // 核验成功即记一次登录：保存本次登录填写的手机号（与台账号不一致也照记）
-        // 与本次登录的 IP 归属地；两者都为空时不记空行。
-        if (phoneNorm || hasLoginLoc) {
-          await db.insert(schema.debtorLogins).values({
-            caseId: fallback.id,
-            phone: phoneNorm,
-            ...loginLoc,
-          });
-        }
+        // 核验成功即记一次登录：保存本次登录填写的手机号（与台账号
+        // 不一致也照记）；登录地点由服务端按请求 IP 异步解析回填。
+        await recordLogin(fallback.id);
         const steps = await db.select().from(schema.progressSteps);
         const sends = await db.select().from(schema.sendRecords);
         const cs = steps.filter((s) => s.caseId === fallback.id);
@@ -2099,15 +2685,9 @@ const baseActions = {
           ),
         };
       }
-      // 核验成功即记一次登录：保存本次登录填写的手机号（与台账号不一致也照记）
-      // 与本次登录的 IP 归属地；两者都为空时不记空行。
-      if (phoneNorm || hasLoginLoc) {
-        await db.insert(schema.debtorLogins).values({
-          caseId: row.id,
-          phone: phoneNorm,
-          ...loginLoc,
-        });
-      }
+      // 核验成功即记一次登录：保存本次登录填写的手机号（与台账号
+      // 不一致也照记）；登录地点由服务端按请求 IP 异步解析回填。
+      await recordLogin(row.id);
       const steps = await db.select().from(schema.progressSteps);
       const sends = await db.select().from(schema.sendRecords);
       const cs = steps.filter((s) => s.caseId === row.id);
@@ -2143,6 +2723,9 @@ const baseActions = {
         .limit(1);
       const row = rows[0];
       if (!row) return { found: false, case: null, steps: [], sends: [] };
+      // 分案可见范围：普通操作员调别人案件的详情直接 403。
+      await assertCaseVisible(ctx, args.id);
+      const assigneeNames = await loadAssigneeNames(ctx);
       const steps = await db
         .select()
         .from(schema.progressSteps)
@@ -2197,6 +2780,9 @@ const baseActions = {
               lastAt: null,
             },
           },
+          row.assigneeId != null
+            ? (assigneeNames.get(row.assigneeId) ?? "")
+            : "",
         ),
         steps: steps.map((s) => ({
           id: s.id,
@@ -2225,9 +2811,18 @@ const baseActions = {
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      // 操作员新建的案件自动归到自己名下（他就是经办人）；管理员建的
+      // 保持未分配，等管理员或分案主管手动分案。
+      const session = currentSession(ctx);
+      const creatorAssigneeId =
+        session && session.role === "user" ? session.operatorId : null;
       const result = await db
         .insert(schema.cases)
-        .values({ ...args, idCard: args.idCard.trim().toUpperCase() })
+        .values({
+          ...args,
+          idCard: args.idCard.trim().toUpperCase(),
+          assigneeId: creatorAssigneeId,
+        })
         .returning({ id: schema.cases.id });
       const inserted = result[0];
       if (!inserted) throw new Error("createCase: insert returned no rows");
@@ -2297,9 +2892,16 @@ const baseActions = {
           continue;
         }
         batchSeen.set(fields.caseNo, rowNumber);
+        // 操作员导入的案件自动归到自己名下；管理员导入的保持未分配。
+        const session = currentSession(ctx);
         const inserted = await db
           .insert(schema.cases)
-          .values({ ...fields, idCard: fields.idCard.trim().toUpperCase() })
+          .values({
+            ...fields,
+            idCard: fields.idCard.trim().toUpperCase(),
+            assigneeId:
+              session && session.role === "user" ? session.operatorId : null,
+          })
           .returning({ id: schema.cases.id });
         const rec = inserted[0];
         if (!rec) {
@@ -2329,6 +2931,7 @@ const baseActions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const { id, ...fields } = args;
+      await assertCaseVisible(ctx, id);
       await db
         .update(schema.cases)
         .set({ ...fields, idCard: fields.idCard.trim().toUpperCase(), updatedAt: new Date() })
@@ -2344,6 +2947,7 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.id);
       await db.batch([
         db.delete(schema.progressSteps).where(eq(schema.progressSteps.caseId, args.id)),
         db.delete(schema.sendRecords).where(eq(schema.sendRecords.caseId, args.id)),
@@ -2364,9 +2968,31 @@ const baseActions = {
     response: z.object({ ok: z.boolean(), deletedCount: z.number() }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
+      // 分案可见范围：普通操作员「删除全部」只删自己名下的案件（连同其
+      // 关联记录），删不到别人名下的；管理员与分案主管才是全删。
+      const visible = await visibleCaseIds(ctx);
       const existing = await db
         .select({ id: schema.cases.id })
         .from(schema.cases);
+      const targetIds = visible
+        ? existing.map((r) => r.id).filter((id) => visible.has(id))
+        : existing.map((r) => r.id);
+      if (visible) {
+        if (targetIds.length > 0) {
+          await db.batch([
+            db.delete(schema.progressSteps).where(inArray(schema.progressSteps.caseId, targetIds)),
+            db.delete(schema.sendRecords).where(inArray(schema.sendRecords.caseId, targetIds)),
+            db.delete(schema.chatMessages).where(inArray(schema.chatMessages.caseId, targetIds)),
+            db.delete(schema.agreements).where(inArray(schema.agreements.caseId, targetIds)),
+            db.delete(schema.payments).where(inArray(schema.payments.caseId, targetIds)),
+            db.delete(schema.linkClicks).where(inArray(schema.linkClicks.caseId, targetIds)),
+            db.delete(schema.debtorLogins).where(inArray(schema.debtorLogins.caseId, targetIds)),
+            db.delete(schema.cases).where(inArray(schema.cases.id, targetIds)),
+          ]);
+        }
+        ctx.invalidateQueries();
+        return { ok: true, deletedCount: targetIds.length };
+      }
       await db.batch([
         db.delete(schema.progressSteps),
         db.delete(schema.sendRecords),
@@ -2394,6 +3020,7 @@ const baseActions = {
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const existing = await db
         .select()
         .from(schema.progressSteps)
@@ -2426,6 +3053,12 @@ const baseActions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const { id, ...fields } = args;
+      const stepRows = await db
+        .select()
+        .from(schema.progressSteps)
+        .where(eq(schema.progressSteps.id, id))
+        .limit(1);
+      if (stepRows[0]) await assertCaseVisible(ctx, stepRows[0].caseId);
       await db
         .update(schema.progressSteps)
         .set(fields)
@@ -2441,6 +3074,12 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const stepRows = await db
+        .select()
+        .from(schema.progressSteps)
+        .where(eq(schema.progressSteps.id, args.id))
+        .limit(1);
+      if (stepRows[0]) await assertCaseVisible(ctx, stepRows[0].caseId);
       await db
         .delete(schema.progressSteps)
         .where(eq(schema.progressSteps.id, args.id));
@@ -2461,6 +3100,7 @@ const baseActions = {
     response: z.object({ ok: z.boolean(), sentAt: z.string() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const now = new Date();
       await db.batch([
         db.insert(schema.sendRecords).values({
@@ -2491,6 +3131,7 @@ const baseActions = {
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const messages = await db
         .select()
         .from(schema.chatMessages)
@@ -2509,6 +3150,7 @@ const baseActions = {
             sender: m.sender,
             text: m.text,
             analysis: m.analysis,
+            actorName: m.actorName ?? "",
             hasImage: m.imageBlobKey != null,
             imageUrl: m.imageBlobKey
               ? ((await ctx.blobs.getUrl(m.imageBlobKey)) ?? "")
@@ -2522,6 +3164,7 @@ const baseActions = {
           kind: a.kind,
           detail: a.detail,
           amountCents: a.amountCents,
+          createdBy: a.createdBy ?? "",
           status: a.status,
           createdAt: a.createdAt.toISOString(),
         })),
@@ -2552,21 +3195,39 @@ const baseActions = {
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const text = args.text ?? "";
       if (!text.trim() && !args.image) {
         throw new Error("消息内容不能为空");
       }
-      // 图片先解码校验大小，超 5MB 直接拒绝，不留空消息行。
       let imageBytes: Buffer | null = null;
       if (args.image) {
+        if (!args.image.mimeType.toLowerCase().startsWith("image/")) {
+          throw new Error("只支持发送图片，请重新选择。");
+        }
         imageBytes = Buffer.from(args.image.dataBase64, "base64");
+        if (imageBytes.length === 0) {
+          throw new Error("图片内容为空，请重新选择。");
+        }
         if (imageBytes.length > 5 * 1024 * 1024) {
           throw new Error("HTTP400:图片文件过大，请上传 5MB 以内的图片");
         }
       }
       const result = await db
         .insert(schema.chatMessages)
-        .values({ caseId: args.caseId, sender: args.sender, text })
+        .values({
+          caseId: args.caseId,
+          sender: args.sender,
+          text,
+          // 经手人：我方消息记发送人的显示名（管理员/操作员），事后能
+          // 看出每句话是谁发的；代记的债务人消息记债务人本人。
+          actorName:
+            args.sender === "agent"
+              ? sessionActorName(currentSession(ctx))
+              : args.sender === "debtor"
+                ? "债务人"
+                : "",
+        })
         .returning({ id: schema.chatMessages.id });
       const inserted = result[0];
       if (!inserted) throw new Error("addChatMessage: insert returned no rows");
@@ -2617,6 +3278,7 @@ const baseActions = {
         .limit(1);
       const row = rows[0];
       if (!row?.imageBlobKey) return { url: null };
+      await assertCaseVisible(ctx, row.caseId);
       const url = await ctx.blobs.getUrl(row.imageBlobKey);
       return { url: url ?? null };
     },
@@ -2786,7 +3448,7 @@ const baseActions = {
 
   setHumanTakeover: defineAction({
     description:
-      "设置案件聊天的人工接管状态（只认管理员，与发送聊天同权限：未登录 401、用户账号 403）：takeover=true 写入接管时间（债务人页机器人停答、显示专员在线），false 清除回到机器人值守。返回切换后的接管状态。",
+      "设置案件聊天的人工接管状态（需「接管」权限，操作员默认有、管理员可在权限管理里回收：未登录 401、无此权限 403）：takeover=true 写入接管时间（债务人页机器人停答、显示专员在线），false 清除回到机器人值守。返回切换后的接管状态。",
     request: z.object({
       caseId: z.number().int().positive(),
       takeover: z.boolean(),
@@ -2794,6 +3456,7 @@ const baseActions = {
     response: z.object({ ok: z.boolean(), humanTakeover: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const rows = await db
         .select()
         .from(schema.cases)
@@ -2814,7 +3477,7 @@ const baseActions = {
 
   setCaseMuted: defineAction({
     description:
-      "设置案件债务人的禁言状态（管理员与用户账号均可，与话术设置保存同权限：未登录 401）：muted=true 写入禁言时间，之后该债务人通过 sendDebtorMessage 发消息会被直接拒绝（文案「该账号已被禁言」），债务人页据 getDebtorChat 返回的 muted 禁用输入框；muted=false 清除禁言恢复发送。禁言只能由管理员或用户在后台手动设置/解除，本系统没有自动禁言。返回切换后的禁言状态。",
+      "设置案件债务人的禁言状态（需「禁言」权限，管理员与操作员默认都有、管理员可在权限管理里按人回收：未登录 401、无此权限 403）：muted=true 写入禁言时间并记经手人显示名，之后该债务人通过 sendDebtorMessage 发消息会被直接拒绝（文案「该账号已被禁言」），债务人页据 getDebtorChat 返回的 muted 禁用输入框；muted=false 清除禁言恢复发送。禁言只能手动设置/解除，本系统没有自动禁言。返回切换后的禁言状态。",
     request: z.object({
       caseId: z.number().int().positive(),
       muted: z.boolean(),
@@ -2822,6 +3485,7 @@ const baseActions = {
     response: z.object({ ok: z.boolean(), muted: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const rows = await db
         .select()
         .from(schema.cases)
@@ -2832,6 +3496,7 @@ const baseActions = {
         .update(schema.cases)
         .set({
           mutedAt: args.muted ? new Date() : null,
+          mutedBy: args.muted ? sessionActorName(currentSession(ctx)) : "",
           updatedAt: new Date(),
         })
         .where(eq(schema.cases.id, args.caseId));
@@ -2853,6 +3518,7 @@ const baseActions = {
         .limit(1);
       const msg = rows[0];
       if (!msg) return { ok: false, analysis: "" };
+      await assertCaseVisible(ctx, msg.caseId);
       // 纯图片消息（无文字）没有可分析的发言内容：不调模型、不编造，直接返回空。
       if (!msg.text.trim()) return { ok: false, analysis: "" };
       const analysis = await runDebtorMessageAnalysis(ctx, msg);
@@ -2874,6 +3540,10 @@ const baseActions = {
         .where(eq(schema.chatMessages.id, args.id))
         .limit(1);
       const row = rows[0];
+      if (row) await assertCaseVisible(ctx, row.caseId);
+      await db
+        .delete(schema.chatMessages)
+        .where(eq(schema.chatMessages.id, args.id));
       if (row?.imageBlobKey) {
         try {
           await ctx.blobs.delete(row.imageBlobKey);
@@ -2881,9 +3551,6 @@ const baseActions = {
           /* 图片文件已不在也不拦删除 */
         }
       }
-      await db
-        .delete(schema.chatMessages)
-        .where(eq(schema.chatMessages.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -2899,6 +3566,7 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       await db
         .update(schema.cases)
         .set({
@@ -2923,9 +3591,14 @@ const baseActions = {
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const result = await db
         .insert(schema.agreements)
-        .values({ ...args, status: "active" })
+        .values({
+          ...args,
+          status: "active",
+          createdBy: sessionActorName(currentSession(ctx)),
+        })
         .returning({ id: schema.agreements.id });
       const inserted = result[0];
       if (!inserted) throw new Error("addAgreement: insert returned no rows");
@@ -2943,6 +3616,12 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const agRows = await db
+        .select()
+        .from(schema.agreements)
+        .where(eq(schema.agreements.id, args.id))
+        .limit(1);
+      if (agRows[0]) await assertCaseVisible(ctx, agRows[0].caseId);
       await db
         .update(schema.agreements)
         .set({ status: args.status })
@@ -2958,6 +3637,12 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const agRows = await db
+        .select()
+        .from(schema.agreements)
+        .where(eq(schema.agreements.id, args.id))
+        .limit(1);
+      if (agRows[0]) await assertCaseVisible(ctx, agRows[0].caseId);
       await db
         .delete(schema.agreements)
         .where(eq(schema.agreements.id, args.id));
@@ -2978,6 +3663,7 @@ const baseActions = {
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const rows = await db
         .select()
         .from(schema.payments)
@@ -2990,6 +3676,7 @@ const baseActions = {
           amountCents: p.amountCents,
           paidOn: p.paidOn,
           note: p.note,
+          recordedBy: p.recordedBy ?? "",
           hasScreenshot: p.screenshotBlobKey != null,
           reconcileStatus: p.reconcileStatus,
           createdAt: p.createdAt.toISOString(),
@@ -3016,6 +3703,7 @@ const baseActions = {
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
       const result = await db
         .insert(schema.payments)
         .values({
@@ -3023,6 +3711,7 @@ const baseActions = {
           amountCents: args.amountCents,
           paidOn: args.paidOn,
           note: args.note,
+          recordedBy: sessionActorName(currentSession(ctx)),
         })
         .returning({ id: schema.payments.id });
       const inserted = result[0];
@@ -3093,6 +3782,7 @@ const baseActions = {
           amountCents: args.amountCents,
           paidOn: args.paidOn,
           note: args.note,
+          recordedBy: "债务人自助提交",
         })
         .returning({ id: schema.payments.id });
       const inserted = result[0];
@@ -3124,6 +3814,12 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const payRows = await db
+        .select()
+        .from(schema.payments)
+        .where(eq(schema.payments.id, args.id))
+        .limit(1);
+      if (payRows[0]) await assertCaseVisible(ctx, payRows[0].caseId);
       await db
         .update(schema.payments)
         .set({ reconcileStatus: args.status })
@@ -3139,6 +3835,12 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      const payRows = await db
+        .select()
+        .from(schema.payments)
+        .where(eq(schema.payments.id, args.id))
+        .limit(1);
+      if (payRows[0]) await assertCaseVisible(ctx, payRows[0].caseId);
       await db
         .delete(schema.payments)
         .where(eq(schema.payments.id, args.id));
@@ -3160,6 +3862,7 @@ const baseActions = {
         .limit(1);
       const row = rows[0];
       if (!row?.screenshotBlobKey) return { url: null };
+      await assertCaseVisible(ctx, row.caseId);
       const url = await ctx.blobs.getUrl(row.screenshotBlobKey);
       return { url: url ?? null };
     },
@@ -3728,7 +4431,7 @@ const baseActions = {
 
   setupPasswords: defineAction({
     description:
-      "首次打开后台时设置管理员密码与用户密码（仅在尚未设置时可用），设置成功后直接以管理员身份进入后台。",
+      "首次打开后台时设置管理员密码与用户密码（仅在尚未设置时可用），设置成功后直接以管理员身份进入后台。用户密码同时成为第一个操作员账号（用户名 user）的密码——多用户登录自此开始，原密码继续能登录。",
     request: z.object({
       adminPassword: z.string().min(4, "管理员密码至少 4 位"),
       userPassword: z.string().min(4, "用户密码至少 4 位"),
@@ -3742,71 +4445,68 @@ const baseActions = {
           ok: false,
           token: null,
           role: null,
+          username: "",
+          displayName: "",
           error: "密码已经设置过了，请直接登录。",
         };
       }
       const secret = randomBytesBase64Url(32);
+      const userHash = await hashPassword(args.userPassword);
       await db.insert(schema.authCredentials).values({
         adminHash: await hashPassword(args.adminPassword),
-        userHash: await hashPassword(args.userPassword),
+        userHash,
         sessionSecret: secret,
         userDisabled: 0,
       });
+      // 第一个操作员账号与旧单用户账号同密码种子（用户名 user）。
+      await ensureOperatorSeed(ctx);
       ctx.invalidateQueries();
       return {
         ok: true,
-        token: await signToken(secret, "admin"),
+        token: await signToken(secret, "admin", null),
         role: "admin",
+        username: "admin",
+        displayName: "管理员",
         error: "",
       };
     },
   }),
 
   login: defineAction({
-    description: "后台登录：选择管理员或用户账号并输入对应密码，成功返回会话令牌。防爆破：同一账号连续输错 5 次锁定 15 分钟，锁定期间输对密码也进不来；登录成功清零失败计数。",
+    description: "后台登录：管理员用管理员密码登录；操作员用管理员分配的用户名 + 密码登录（role=user 时传 username，不传时按第一个操作员账号 user 处理，兼容旧登录页）。成功返回会话令牌与身份信息（用户名、显示名）。防爆破：同一账号连续输错 5 次锁定 15 分钟（管理员与每个操作员各自计数，存各自的表行），锁定期间输对密码也进不来；登录成功清零失败计数。用户账号被管理员整体停用（旧开关）或单个操作员被停用时，都无法登录。",
     request: z.object({
       role: z.enum(["admin", "user"]),
+      username: z.string().default(""),
       password: z.string().min(1, "请输入密码"),
     }),
     response: loginOut,
     async handler(ctx, args): Promise<z.infer<typeof loginOut>> {
-      const db = ctx.db<typeof schema>();
+      const fail = (error: string): z.infer<typeof loginOut> => ({
+        ok: false,
+        token: null,
+        role: null,
+        username: "",
+        displayName: "",
+        error,
+      });
       const row = await loadCredentials(ctx);
       if (!row) {
-        return {
-          ok: false,
-          token: null,
-          role: null,
-          error: "尚未设置密码，请先完成首次设置。",
-        };
+        return fail("尚未设置密码，请先完成首次设置。");
       }
-      if (args.role === "user" && row.userDisabled === 1) {
-        return {
-          ok: false,
-          token: null,
-          role: null,
-          error: "用户账号已被管理员停用，无法登录。",
-        };
-      }
-      const failCount =
-        args.role === "admin" ? row.adminFailCount : row.userFailCount;
-      const lockedUntil =
-        args.role === "admin" ? row.adminLockedUntil : row.userLockedUntil;
       const now = Date.now();
-      if (lockedUntil > now) {
-        const mins = Math.max(1, Math.ceil((lockedUntil - now) / 60_000));
-        return {
-          ok: false,
-          token: null,
-          role: null,
-          error: `连续输错密码次数过多，该账号已锁定，请 ${mins} 分钟后再试。`,
-        };
-      }
-      const stored = args.role === "admin" ? row.adminHash : row.userHash;
-      if (!(await verifyPassword(args.password, stored))) {
-        // 原子递增：并发下多次输错也不会互相覆盖计数（SQL 层 +1，再读回最新值定夺）。
-        // 先查后写在这里是错的——PBKDF2 验密耗时几十毫秒，并发请求会全读到旧计数。
-        if (args.role === "admin") {
+      if (args.role === "admin") {
+        if (row.adminLockedUntil > now) {
+          const mins = Math.max(
+            1,
+            Math.ceil((row.adminLockedUntil - now) / 60_000),
+          );
+          return fail(
+            `连续输错密码次数过多，该账号已锁定，请 ${mins} 分钟后再试。`,
+          );
+        }
+        if (!(await verifyPassword(args.password, row.adminHash))) {
+          // 原子递增：并发下多次输错也不会互相覆盖计数（SQL 层 +1，再读回最新值定夺）。
+          const db = ctx.db<typeof schema>();
           await db
             .update(schema.authCredentials)
             .set({
@@ -3814,39 +4514,82 @@ const baseActions = {
               updatedAt: new Date(),
             })
             .where(eq(schema.authCredentials.id, row.id));
-        } else {
-          await db
-            .update(schema.authCredentials)
-            .set({
-              userFailCount: sql`${schema.authCredentials.userFailCount} + 1`,
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.authCredentials.id, row.id));
+          const fresh = await loadCredentials(ctx);
+          const next = fresh ? fresh.adminFailCount : 0;
+          if (next >= LOGIN_MAX_FAILURES) {
+            await updateLoginLockState(ctx, row.id, "admin", 0, now + LOGIN_LOCK_MS);
+            return fail("密码不正确。已连续输错 5 次，该账号锁定 15 分钟，请稍后再试。");
+          }
+          return fail("密码不正确，请重新输入。");
         }
-        const fresh = await loadCredentials(ctx);
-        const next = fresh
-          ? args.role === "admin"
-            ? fresh.adminFailCount
-            : fresh.userFailCount
-          : 0;
-        if (next >= LOGIN_MAX_FAILURES) {
-          await updateLoginLockState(ctx, row.id, args.role, 0, now + LOGIN_LOCK_MS);
-          return {
-            ok: false,
-            token: null,
-            role: null,
-            error: "密码不正确。已连续输错 5 次，该账号锁定 15 分钟，请稍后再试。",
-          };
+        if (row.adminFailCount !== 0 || row.adminLockedUntil !== 0) {
+          await updateLoginLockState(ctx, row.id, "admin", 0, 0);
         }
-        return { ok: false, token: null, role: null, error: "密码不正确，请重新输入。" };
+        return {
+          ok: true,
+          token: await signToken(row.sessionSecret, "admin", null),
+          role: "admin",
+          username: "admin",
+          displayName: "管理员",
+          error: "",
+        };
       }
-      if (failCount !== 0 || lockedUntil !== 0) {
-        await updateLoginLockState(ctx, row.id, args.role, 0, 0);
+      // 操作员登录：旧的整体停用开关仍然有效（停用后所有操作员都登不进）。
+      if (row.userDisabled === 1) {
+        return fail("用户账号已被管理员停用，无法登录。");
+      }
+      await ensureOperatorSeed(ctx);
+      const db = ctx.db<typeof schema>();
+      const usernameNorm = (args.username ?? "").trim().toLowerCase();
+      const ops = await loadOperators(ctx);
+      const op = usernameNorm
+        ? ops.find((o) => o.username.toLowerCase() === usernameNorm)
+        : ops.find((o) => o.username.toLowerCase() === "user") ?? ops[0];
+      if (!op) {
+        return fail("用户名或密码不正确，请重新输入。");
+      }
+      if (op.disabled === 1) {
+        return fail("该操作员账号已被管理员停用，无法登录。");
+      }
+      if (op.lockedUntil > now) {
+        const mins = Math.max(1, Math.ceil((op.lockedUntil - now) / 60_000));
+        return fail(
+          `连续输错密码次数过多，该账号已锁定，请 ${mins} 分钟后再试。`,
+        );
+      }
+      if (!(await verifyPassword(args.password, op.passwordHash))) {
+        // 原子递增：并发下多次输错也不会互相覆盖计数（SQL 层 +1，再读回最新值定夺）。
+        await db
+          .update(schema.operators)
+          .set({
+            failCount: sql`${schema.operators.failCount} + 1`,
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.operators.id, op.id));
+        const freshOps = await loadOperators(ctx);
+        const freshOp = freshOps.find((o) => o.id === op.id);
+        const next = freshOp ? freshOp.failCount : 0;
+        if (next >= LOGIN_MAX_FAILURES) {
+          await db
+            .update(schema.operators)
+            .set({ failCount: 0, lockedUntil: now + LOGIN_LOCK_MS, updatedAt: new Date() })
+            .where(eq(schema.operators.id, op.id));
+          return fail("密码不正确。已连续输错 5 次，该账号锁定 15 分钟，请稍后再试。");
+        }
+        return fail("用户名或密码不正确，请重新输入。");
+      }
+      if (op.failCount !== 0 || op.lockedUntil !== 0) {
+        await db
+          .update(schema.operators)
+          .set({ failCount: 0, lockedUntil: 0, updatedAt: new Date() })
+          .where(eq(schema.operators.id, op.id));
       }
       return {
         ok: true,
-        token: await signToken(row.sessionSecret, args.role),
-        role: args.role,
+        token: await signToken(row.sessionSecret, "user", op.id),
+        role: "user",
+        username: op.username,
+        displayName: op.displayName || op.username,
         error: "",
       };
     },
@@ -4071,18 +4814,45 @@ const baseActions = {
   }),
 
   getSession: defineAction({
-    description: "校验会话令牌，返回当前登录身份；未登录、已过期或账号被停用时身份为空。",
+    description: "校验会话令牌，返回当前登录身份：角色、操作员 id、用户名、显示名、权限键列表、是否分案主管（canAssign）与是否看全部案件（scopeAll）；未登录、已过期或账号被停用时身份为空、其余字段为空值。前端据此渲染权限管理入口、按权限启用功能、收件箱「我的/全部」切换与负责人显示。",
     request: z.object({ token: z.string().default("") }),
-    response: z.object({ role: z.enum(["admin", "user"]).nullable() }),
+    response: z.object({
+      role: z.enum(["admin", "user"]).nullable(),
+      operatorId: z.number().nullable(),
+      username: z.string(),
+      displayName: z.string(),
+      permissions: z.array(z.string()),
+      canAssign: z.boolean(),
+      scopeAll: z.boolean(),
+    }),
     async handler(ctx, args) {
-      const role = await roleForToken(ctx, args.token);
-      return { role };
+      const session = await sessionForToken(ctx, args.token);
+      if (!session) {
+        return {
+          role: null,
+          operatorId: null,
+          username: "",
+          displayName: "",
+          permissions: [],
+          canAssign: false,
+          scopeAll: false,
+        };
+      }
+      return {
+        role: session.role,
+        operatorId: session.operatorId,
+        username: session.username,
+        displayName: session.displayName,
+        permissions: [...session.permissions],
+        canAssign: session.canAssign,
+        scopeAll: session.scopeAll,
+      };
     },
   }),
 
   changePasswords: defineAction({
     description:
-      "管理员修改登录密码：可改管理员密码、用户密码或两者一起改，留空的项不改。仅管理员可用。",
+      "管理员修改登录密码：可改管理员密码、第一个操作员账号（用户名 user）的密码或两者一起改，留空的项不改。仅管理员可用。单个操作员的密码在「权限管理」里按人改（updateOperator）。",
     request: z.object({
       adminPassword: z.string().default(""),
       userPassword: z.string().default(""),
@@ -4110,9 +4880,11 @@ const baseActions = {
         patch.adminFailCount = 0;
         patch.adminLockedUntil = 0;
       }
+      let userHashNew: string | null = null;
       if (args.userPassword) {
         if (args.userPassword.length < 4) throw new Error("用户密码至少 4 位。");
-        patch.userHash = await hashPassword(args.userPassword);
+        userHashNew = await hashPassword(args.userPassword);
+        patch.userHash = userHashNew;
         patch.userFailCount = 0;
         patch.userLockedUntil = 0;
       }
@@ -4121,6 +4893,19 @@ const baseActions = {
         .update(schema.authCredentials)
         .set(patch)
         .where(eq(schema.authCredentials.id, row.id));
+      // 「用户密码」现在对应第一个操作员账号（用户名 user）：同步改它的
+      // 密码哈希并解锁，保持旧改密入口语义不变。
+      if (userHashNew) {
+        await ensureOperatorSeed(ctx);
+        const ops = await loadOperators(ctx);
+        const seed = ops.find((o) => o.username.toLowerCase() === "user");
+        if (seed) {
+          await db
+            .update(schema.operators)
+            .set({ passwordHash: userHashNew, failCount: 0, lockedUntil: 0, updatedAt: new Date() })
+            .where(eq(schema.operators.id, seed.id));
+        }
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4141,6 +4926,229 @@ const baseActions = {
         .where(eq(schema.authCredentials.id, row.id));
       ctx.invalidateQueries();
       return { ok: true, userDisabled: args.disabled };
+    },
+  }),
+
+  /* ---------------- 操作员账号与权限管理（仅管理员） ---------------- */
+
+  listOperators: defineAction({
+    description:
+      "列出全部操作员账号（仅管理员）：用户名、显示名、是否停用、权限键列表、是否是分案主管（含分案权限）、当前负责案件数，并附全部可开关的权限项定义（键 + 中文名）供权限管理页渲染。首次调用时若还没有操作员账号，会先用旧用户密码种子生成第一个操作员账号（用户名 user）。",
+    request: z.object({}),
+    response: z.object({
+      operators: z.array(
+        z.object({
+          id: z.number(),
+          username: z.string(),
+          displayName: z.string(),
+          disabled: z.boolean(),
+          permissions: z.array(z.string()),
+          isSupervisor: z.boolean(),
+          caseCount: z.number(),
+        }),
+      ),
+      permissionDefs: z.array(
+        z.object({ key: z.string(), label: z.string() }),
+      ),
+    }),
+    async handler(ctx) {
+      await ensureOperatorSeed(ctx);
+      const db = ctx.db<typeof schema>();
+      const ops = await loadOperators(ctx);
+      const caseRows = await db
+        .select({ assigneeId: schema.cases.assigneeId })
+        .from(schema.cases);
+      const counts = new Map<number, number>();
+      for (const r of caseRows) {
+        if (r.assigneeId != null) {
+          counts.set(r.assigneeId, (counts.get(r.assigneeId) ?? 0) + 1);
+        }
+      }
+      return {
+        operators: ops.map((o) => {
+          const perms = parsePermissions(o.permissions);
+          return {
+            id: o.id,
+            username: o.username,
+            displayName: o.displayName || o.username,
+            disabled: o.disabled === 1,
+            permissions: perms,
+            isSupervisor: perms.includes("assign"),
+            caseCount: counts.get(o.id) ?? 0,
+          };
+        }),
+        permissionDefs: PERMISSION_DEFS.map((d) => ({
+          key: d.key as string,
+          label: d.label as string,
+        })),
+      };
+    },
+  }),
+
+  createOperator: defineAction({
+    description:
+      "新建一个操作员账号（仅管理员）：用户名（登录用，全站唯一、忽略大小写）、显示名（显示在经手人与负责人处）、初始密码（至少 4 位）都由管理员设定。新账号默认业务权限全开、「分案」权限不开（在权限管理里授予后即为分案主管）。",
+    request: z.object({
+      username: z.string().trim().min(1, "用户名不能为空").max(32, "用户名最长 32 个字符"),
+      displayName: z.string().trim().min(1, "显示名不能为空").max(32, "显示名最长 32 个字符"),
+      password: z.string().min(4, "密码至少 4 位"),
+    }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      await ensureOperatorSeed(ctx);
+      const db = ctx.db<typeof schema>();
+      const ops = await loadOperators(ctx);
+      const usernameNorm = args.username.toLowerCase();
+      if (usernameNorm === "admin") {
+        throw new Error("用户名不能用 admin（管理员专用）。");
+      }
+      if (ops.some((o) => o.username.toLowerCase() === usernameNorm)) {
+        throw new Error("该用户名已被使用，请换一个。");
+      }
+      const result = await db
+        .insert(schema.operators)
+        .values({
+          username: args.username,
+          displayName: args.displayName,
+          passwordHash: await hashPassword(args.password),
+          permissions: JSON.stringify(DEFAULT_OPERATOR_PERMISSIONS),
+          disabled: 0,
+        })
+        .returning({ id: schema.operators.id });
+      const inserted = result[0];
+      if (!inserted) throw new Error("createOperator: insert returned no rows");
+      ctx.invalidateQueries();
+      return { id: inserted.id };
+    },
+  }),
+
+  updateOperator: defineAction({
+    description:
+      "修改一个操作员账号（仅管理员）：可改显示名、重置密码（至少 4 位，同时清掉登录失败计数与锁定）、停用或恢复（停用后该账号无法登录、已有会话立即失效）。留空/不传的项不改。用户名是登录标识，不可改。",
+    request: z.object({
+      id: z.number().int().positive(),
+      displayName: z.string().trim().max(32, "显示名最长 32 个字符").default(""),
+      password: z.string().default(""),
+      disabled: z.boolean().nullable().default(null),
+    }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const ops = await loadOperators(ctx);
+      const op = ops.find((o) => o.id === args.id);
+      if (!op) throw new Error("未找到该操作员账号。");
+      const patch: {
+        displayName?: string;
+        passwordHash?: string;
+        failCount?: number;
+        lockedUntil?: number;
+        disabled?: number;
+        updatedAt: Date;
+      } = { updatedAt: new Date() };
+      if (args.displayName) patch.displayName = args.displayName;
+      if (args.password) {
+        if (args.password.length < 4) throw new Error("密码至少 4 位。");
+        patch.passwordHash = await hashPassword(args.password);
+        patch.failCount = 0;
+        patch.lockedUntil = 0;
+      }
+      if (args.disabled !== null) patch.disabled = args.disabled ? 1 : 0;
+      await db
+        .update(schema.operators)
+        .set(patch)
+        .where(eq(schema.operators.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  setOperatorPermissions: defineAction({
+    description:
+      "设置一个操作员的权限集合（仅管理员）：传入完整的权限键列表整单覆盖，改完立即生效（该账号下一次调用接口即按新权限校验，已打开的页面下一次刷新生效）。权限键：chat 发聊天、analysis 分析、agreement 协议、payment 登记/对账还款、takeover 接管、mute 禁言、cases 案件、content 内容、scripts 话术、assign 分案（授予即分案主管：看全部案件并可分案改派）。改密码、停用账号与本接口本身只认管理员，不在可授予之列。",
+    request: z.object({
+      id: z.number().int().positive(),
+      permissions: z.array(z.string()),
+    }),
+    response: z.object({ ok: z.boolean(), permissions: z.array(z.string()) }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const ops = await loadOperators(ctx);
+      const op = ops.find((o) => o.id === args.id);
+      if (!op) throw new Error("未找到该操作员账号。");
+      const perms = [...new Set(args.permissions)].filter((p) =>
+        PERMISSION_KEYS.has(p),
+      );
+      await db
+        .update(schema.operators)
+        .set({ permissions: JSON.stringify(perms), updatedAt: new Date() })
+        .where(eq(schema.operators.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true, permissions: perms };
+    },
+  }),
+
+  listAssignees: defineAction({
+    description:
+      "负责人候选列表（登录即可读）：全部未停用的操作员账号（id、用户名、显示名），供分案界面选择负责人、案件行与收件箱显示负责人名字。",
+    request: z.object({}),
+    response: z.object({
+      assignees: z.array(
+        z.object({
+          id: z.number(),
+          username: z.string(),
+          displayName: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx) {
+      await ensureOperatorSeed(ctx);
+      const ops = await loadOperators(ctx);
+      return {
+        assignees: ops
+          .filter((o) => o.disabled !== 1)
+          .map((o) => ({
+            id: o.id,
+            username: o.username,
+            displayName: o.displayName || o.username,
+          })),
+      };
+    },
+  }),
+
+  assignCases: defineAction({
+    description:
+      "分案：把一批案件手动指定给某个负责人（操作员），或取消分配（assigneeId 传 null 回到未分配）；随时可改派。只有管理员与有「分案」权限的操作员（分案主管）能调用，普通操作员调用返回 403。分配结果立即影响各操作员的可见范围（案件、收件箱、统计、名单）。",
+    request: z.object({
+      caseIds: z.array(z.number().int().positive()).min(1, "至少选择一个案件"),
+      assigneeId: z.number().int().positive().nullable(),
+    }),
+    response: z.object({ ok: z.boolean(), updated: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      if (args.assigneeId !== null) {
+        const ops = await loadOperators(ctx);
+        const target = ops.find((o) => o.id === args.assigneeId);
+        if (!target) throw new Error("未找到要分配的操作员账号。");
+        if (target.disabled === 1) {
+          throw new Error("该操作员账号已停用，不能再分案给他。");
+        }
+      }
+      await db
+        .update(schema.cases)
+        .set({ assigneeId: args.assigneeId, updatedAt: new Date() })
+        .where(inArray(schema.cases.id, args.caseIds));
+      ctx.invalidateQueries();
+      return { ok: true, updated: args.caseIds.length };
+    },
+  }),
+
+  getOperatorPerformance: defineAction({
+    description:
+      "操作员回款能力分析（大数据统计页版块）：每个操作员一行——负责案件数、总欠款、已回款、回款率、平均回款天数（建档到第一笔确认回款）、高意愿未回款数；沟通信号来自其名下案件的聊天记录：债务人消息数、我方回复数、平均回复时长（小时）、高意愿未跟进数（高意愿且未结清、最后一条债务人消息后还没有我方回复的案件）、拖延信号总次数与抓到（其后有我方回复跟进）次数；建议由服务端按规则生成（回款率低于团队平均、积压最多、高意愿未跟进、拖延信号没抓到、回复不及时，无问题时为表现稳定）。管理员与分案主管看全部操作员，普通操作员只返回自己一行。",
+    request: z.object({}),
+    response: z.object({ rows: z.array(operatorPerfOut) }),
+    async handler(ctx) {
+      return { rows: await computeOperatorPerformance(ctx) };
     },
   }),
 } satisfies ActionsModule;
@@ -4251,10 +5259,18 @@ async function hmacBase64Url(secret: string, payload: string): Promise<string> {
   return bytesToBase64Url(new Uint8Array(sig));
 }
 
-async function signToken(secret: string, role: AuthRole): Promise<string> {
+async function signToken(
+  secret: string,
+  role: AuthRole,
+  operatorId: number | null,
+): Promise<string> {
   const payload = bytesToBase64Url(
     textEncoder.encode(
-      JSON.stringify({ role, exp: Date.now() + SESSION_TTL_MS }),
+      JSON.stringify({
+        role,
+        op: operatorId,
+        exp: Date.now() + SESSION_TTL_MS,
+      }),
     ),
   );
   const sig = await hmacBase64Url(secret, payload);
@@ -4301,7 +5317,15 @@ async function updateLoginLockState(
     .where(eq(schema.authCredentials.id, rowId));
 }
 
-async function roleForToken(ctx: Ctx, token: string): Promise<AuthRole | null> {
+/* 解析会话令牌为完整会话：管理员，或某个操作员（带其权限集合）。
+   令牌载荷 {role, op, exp}：op 是操作员 id（管理员为 null）。旧版
+   令牌没有 op 字段——按第一个操作员账号（种子 user）解析，平滑过渡。
+   操作员被停用、或用户账号被整体停用后，其已有会话立即失效；
+   操作员被删除式停用以外的变更（改权限）下一次调用即按新权限走。 */
+async function sessionForToken(
+  ctx: Ctx,
+  token: string,
+): Promise<Session | null> {
   if (!token) return null;
   const row = await loadCredentials(ctx);
   if (!row || !row.sessionSecret) return null;
@@ -4324,20 +5348,46 @@ async function roleForToken(ctx: Ctx, token: string): Promise<AuthRole | null> {
     rec.role === "admin" ? "admin" : rec.role === "user" ? "user" : null;
   const exp = typeof rec.exp === "number" ? rec.exp : 0;
   if (!role || exp < Date.now()) return null;
-  // 用户账号被管理员停用后，其已有会话立即失效
-  if (role === "user" && row.userDisabled === 1) return null;
-  return role;
+  if (role === "admin") {
+    return {
+      role: "admin",
+      operatorId: null,
+      username: "admin",
+      displayName: "管理员",
+      permissions: new Set(PERMISSION_KEYS),
+      scopeAll: true,
+      canAssign: true,
+    };
+  }
+  // 用户账号被管理员整体停用后，所有操作员会话立即失效
+  if (row.userDisabled === 1) return null;
+  await ensureOperatorSeed(ctx);
+  const ops = await loadOperators(ctx);
+  const opId = typeof rec.op === "number" ? rec.op : null;
+  const op =
+    (opId != null ? ops.find((o) => o.id === opId) : undefined) ??
+    ops.find((o) => o.username.toLowerCase() === "user") ??
+    ops[0];
+  if (!op || op.disabled === 1) return null;
+  const permissions = new Set(parsePermissions(op.permissions));
+  const canAssign = permissions.has("assign");
+  return {
+    role: "user",
+    operatorId: op.id,
+    username: op.username,
+    displayName: op.displayName || op.username,
+    permissions,
+    scopeAll: canAssign,
+    canAssign,
+  };
 }
 
 /* ---------------- 权限守卫 ---------------- */
 
-// 登录相关接口与债务人端点击记录不守卫（内部自行校验）。
-// 注意：verifyIdentity 与 getHomepageContent 必须是公开的——债务人网页
-// （Netlify 前端）在未登录状态下直接调它们（核验登录、首页内容），请求里
-// 不带 sessionToken；如果把它们留在守卫里，债务人登录与首页内容加载会
-// 被 guardActions 以“未登录”全部拒绝。原空间 artifact 的守卫把这两
-// 个放在 READ_ACTIONS 而非 PUBLIC_ACTIONS，债务人端同样会被拦，这是
-// 原实现的一个潜在问题；独立部署这里按前端实际调用方式修正。
+// 登录相关接口与债务人端公开接口不守卫（内部自行校验/限流）：
+// 债务人网页没有后台登录令牌，verifyIdentity 必须公开可达——它只
+// 受自身的核验限流约束（verify_attempts 表：同身份证/同手机号
+// 10 分钟 20 次、全站 600 次兜底），与生产后端行为一致。
 const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "getAuthStatus",
   "setupPasswords",
@@ -4353,24 +5403,24 @@ const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "getChatScripts",
 ]);
 
-// 只读查看：管理员与用户都能用
+// 只读查看：管理员与任何操作员都能用（数据按分案范围在 handler 里过滤）
 const READ_ACTIONS: ReadonlySet<string> = new Set([
   "listCases",
   "listChatInbox",
   "listPendingPayments",
   "getStats",
-  "verifyIdentity",
   "getCase",
   "getChat",
   "getChatImage",
   "getPayments",
   "getPaymentScreenshot",
   "getHomepageContent",
+  "listAssignees",
+  "getOperatorPerformance",
 ]);
 
-// 案件台账写入：管理员与用户都能建、改、删、导案件
-//（新建 / Excel 导入 / 修改 / 删除单个 / 删除全部 / 进度步骤 / 发送登记）。
-// 仍只认管理员的：聊天发送与分析、协议、还款登记与对账、改密码、停用账号。
+// 案件台账写入（案件权限）：新建 / Excel 导入 / 修改 / 删除单个 /
+// 删除全部 / 进度步骤 / 发送登记。
 const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
   "createCase",
   "importCases",
@@ -4383,7 +5433,8 @@ const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
   "registerSend",
 ]);
 
-// 网页首页内容（页面信息）编辑：管理员与用户都能改
+// 网页首页内容编辑（内容权限）：审结案件、律师动态、保全划扣、今日
+// 已还款、滚动条、失信惩戒、付款卡、账单示例与系统名称。
 const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "addCourtCase",
   "updateCourtCase",
@@ -4408,10 +5459,54 @@ const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "updatePaymentSettings",
   "updateDemoBill",
   "updateSystemName",
-  "saveChatScripts",
-  // 禁言开关与话术设置保存同权限：管理员与用户均可禁言/解除禁言
-  //（人工接管 setHumanTakeover 不在此列，仍只认管理员）。
-  "setCaseMuted",
+]);
+
+/* 操作员权限 → 接口映射（v16）：业务动作按项授权，管理员可在
+   「权限管理」里按人开关，关掉即刻 403、打开即刻恢复。管理员本人
+   不受此表约束（全通）。改密码、停用账号、操作员与权限管理本身
+   不在此表——只认管理员（ADMIN_ONLY_ACTIONS）。 */
+const ACTION_PERMISSIONS: ReadonlyMap<string, PermissionKey> = new Map<
+  string,
+  PermissionKey
+>([
+  // 发聊天：发/删聊天消息、转人工标记
+  ["addChatMessage", "chat"],
+  ["deleteChatMessage", "chat"],
+  ["setNeedsHuman", "chat"],
+  // 分析：手动分析债务人的一句话
+  ["analyzeChatMessage", "analysis"],
+  // 协议：协商事项的增改删
+  ["addAgreement", "agreement"],
+  ["updateAgreementStatus", "agreement"],
+  ["deleteAgreement", "agreement"],
+  // 登记 / 对账还款
+  ["addPayment", "payment"],
+  ["setPaymentReconcile", "payment"],
+  ["deletePayment", "payment"],
+  // 接管
+  ["setHumanTakeover", "takeover"],
+  // 禁言
+  ["setCaseMuted", "mute"],
+  // 话术
+  ["saveChatScripts", "scripts"],
+  // 分案
+  ["assignCases", "assign"],
+  ...[...CASE_WRITE_ACTIONS].map(
+    (name) => [name, "cases"] as [string, PermissionKey],
+  ),
+  ...[...PAGE_EDIT_ACTIONS].map(
+    (name) => [name, "content"] as [string, PermissionKey],
+  ),
+]);
+
+// 只认管理员：账号与权限管理本身、改密码、整体停用开关。
+const ADMIN_ONLY_ACTIONS: ReadonlySet<string> = new Set([
+  "changePasswords",
+  "setUserDisabled",
+  "listOperators",
+  "createOperator",
+  "updateOperator",
+  "setOperatorPermissions",
 ]);
 
 type AnyActionDef = ActionDefinition<z.ZodType, z.ZodType>;
@@ -4425,6 +5520,14 @@ type AnyActionDef = ActionDefinition<z.ZodType, z.ZodType>;
 const NOT_LOGGED_IN_MESSAGE = "未登录或登录已失效，请重新登录后再操作。";
 const ADMIN_ONLY_MESSAGE =
   "用户账号不能发送聊天、登记还款或管理账号，该操作只认管理员。";
+/* v16 新增的两类 403 拒绝（文案含且只含「只认管理员」标记，与上面的
+   契约同一套状态码映射规则）：
+   - PERMISSION_DENIED：操作员的这项权限被管理员在权限管理里关掉了；
+   - SCOPE_DENIED：普通操作员访问不属于自己负责范围的案件。 */
+const PERMISSION_DENIED_MESSAGE =
+  "你的这项操作权限已被管理员关闭，该操作只认管理员在「权限管理」里重新开通后才能使用。";
+const SCOPE_DENIED_MESSAGE =
+  "该案件不在你的负责范围内，你只能查看和操作分给自己的案件；全部案件只认管理员与分案主管。";
 
 /* 限流拒绝文案与 429 的契约（与上面的 401/403 契约同一套机制）：
    一切限流拒绝统一用这条文案——含「稍后再试」、不含「未登录」「只认管理员」。
@@ -4512,9 +5615,11 @@ function hitRateLimit(key: string, max: number, windowMs: number): boolean {
   return false;
 }
 
-// 给每个业务接口套上登录与角色校验：请求里多收一个 sessionToken（本地会话令牌），
-// 未登录一律拒绝；只读查看、案件台账写入与网页首页内容编辑管理员与用户都能用，
-// 聊天发送、还款登记、改密码、停用账号只认管理员。
+// 给每个业务接口套上登录与权限校验：请求里多收一个 sessionToken
+// （本地会话令牌），未登录一律拒绝（401 文案）；管理员全通；操作员
+// 按「权限管理」里授予他的权限逐项放行（关掉即 403），账号与权限
+// 管理本身只认管理员。会话解析后放进 sessionStore，handler 里据此
+// 做分案范围过滤与经手人记录。
 function guardActions<T extends Record<string, AnyActionDef>>(defs: T): T {
   const out: Record<string, AnyActionDef> = {};
   for (const [name, def] of Object.entries(defs)) {
@@ -4522,10 +5627,6 @@ function guardActions<T extends Record<string, AnyActionDef>>(defs: T): T {
       out[name] = def;
       continue;
     }
-    const userAllowed =
-      READ_ACTIONS.has(name) ||
-      PAGE_EDIT_ACTIONS.has(name) ||
-      CASE_WRITE_ACTIONS.has(name);
     const request = (def.request as z.ZodObject<z.ZodRawShape>).passthrough();
     out[name] = {
       ...def,
@@ -4544,12 +5645,28 @@ function guardActions<T extends Record<string, AnyActionDef>>(defs: T): T {
         ) {
           throw new Error(RATE_LIMIT_MESSAGE);
         }
-        const role = await roleForToken(ctx, token);
-        if (!role) throw new Error(NOT_LOGGED_IN_MESSAGE);
-        if (role !== "admin" && !userAllowed) {
-          throw new Error(ADMIN_ONLY_MESSAGE);
+        const session = await sessionForToken(ctx, token);
+        if (!session) throw new Error(NOT_LOGGED_IN_MESSAGE);
+        if (session.role !== "admin") {
+          if (ADMIN_ONLY_ACTIONS.has(name)) {
+            throw new Error(ADMIN_ONLY_MESSAGE);
+          }
+          const required = ACTION_PERMISSIONS.get(name);
+          if (required) {
+            if (!session.permissions.has(required)) {
+              throw new Error(PERMISSION_DENIED_MESSAGE);
+            }
+          } else if (!READ_ACTIONS.has(name)) {
+            // 未登记的业务动作默认只认管理员，防新接口漏配权限。
+            throw new Error(ADMIN_ONLY_MESSAGE);
+          }
         }
-        return def.handler(ctx, rec);
+        sessionStore.set(ctx, session);
+        try {
+          return await def.handler(ctx, rec);
+        } finally {
+          sessionStore.delete(ctx);
+        }
       },
     };
   }
