@@ -2319,6 +2319,67 @@ const baseActions = {
     },
   }),
 
+  submitPaymentScreenshot: defineAction({
+    description:
+      "债务人公开上传付款截图：凭案件 id 与身份证号双重校验后登记一笔待对账还款并存截图，不需登录令牌。",
+    request: z.object({
+      caseId: z.number().int().positive(),
+      idCard: z.string().trim().min(18, "身份证号必须为18位").max(18, "身份证号必须为18位"),
+      amountCents: z.number().int().min(1, "还款金额必须大于 0"),
+      paidOn: z.string().min(1, "请填写还款日期"),
+      note: z.string().default(""),
+      screenshot: z.object({
+        dataBase64: z.string().min(1, "请上传付款截图"),
+        mimeType: z
+          .string()
+          .regex(/^image\//, "截图必须是图片"),
+      }),
+    }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const idCardNorm = args.idCard.trim().toUpperCase();
+      const rows = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, args.caseId))
+        .limit(1);
+      const row = rows[0];
+      if (!row) throw new Error("HTTP400:未找到匹配的案件记录");
+      if ((row.idCard ?? "").trim().toUpperCase() !== idCardNorm) {
+        throw new Error("HTTP400:身份证号与案件不匹配");
+      }
+      const bytes = Buffer.from(args.screenshot.dataBase64, "base64");
+      if (bytes.length > 5 * 1024 * 1024) {
+        throw new Error("HTTP400:截图文件过大，请上传 5MB 以内的图片");
+      }
+      const result = await db
+        .insert(schema.payments)
+        .values({
+          caseId: args.caseId,
+          amountCents: args.amountCents,
+          paidOn: args.paidOn,
+          note: args.note,
+        })
+        .returning({ id: schema.payments.id });
+      const inserted = result[0];
+      if (!inserted) throw new Error("submitPaymentScreenshot: insert returned no rows");
+      const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const key = `payment-screenshots/${inserted.id}-${randomHex}`;
+      await ctx.blobs.put(key, bytes, {
+        contentType: args.screenshot.mimeType,
+      });
+      await db
+        .update(schema.payments)
+        .set({ screenshotBlobKey: key })
+        .where(eq(schema.payments.id, inserted.id));
+      ctx.invalidateQueries();
+      return { id: inserted.id };
+    },
+  }),
+
   setPaymentReconcile: defineAction({
     description: "给一笔还款做银行对账标记：待对账、已对平或对不上。",
     request: z.object({
@@ -3263,6 +3324,7 @@ const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "getSystemName",
   "verifyIdentity",
   "getHomepageContent",
+  "submitPaymentScreenshot",
 ]);
 
 // 只读查看：管理员与用户都能用

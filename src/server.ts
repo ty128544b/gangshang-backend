@@ -347,6 +347,11 @@ async function dispatch(
     return { status: 200, body: { data: checked } };
   } catch (e) {
     const msg = (e as Error).message || "接口执行失败";
+    // handler 抛 "HTTP400:..." 表示请求有误（案件不存在、证件不匹配、
+    // 文件过大等），去掉前缀后按 400 返回，不当作服务器内部错误。
+    if (msg.startsWith("HTTP400:")) {
+      return { status: 400, body: { error: msg.slice("HTTP400:".length) } };
+    }
     const status = msg.includes("未登录")
       ? 401
       : msg.includes("只认管理员")
@@ -528,7 +533,12 @@ const server = createServer(async (req, res) => {
         typeof body.args === "object" && body.args !== null
           ? (body.args as Record<string, unknown>)
           : {};
-      if (name === "verifyIdentity" && checkVerifyLimit(ip)) {
+      // submitPaymentScreenshot 与 verifyIdentity 共用同一核验限流窗口
+      //（同一 IP 每 10 分钟 20 次），防身份证枚举与截图接口滥用。
+      if (
+        (name === "verifyIdentity" || name === "submitPaymentScreenshot") &&
+        checkVerifyLimit(ip)
+      ) {
         tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
         return;
       }
@@ -620,7 +630,12 @@ const server = createServer(async (req, res) => {
         typeof args === "object" && args !== null
           ? (args as Record<string, unknown>)
           : {};
-      if (name === "verifyIdentity" && checkVerifyLimit(ip)) {
+      // submitPaymentScreenshot 与 verifyIdentity 共用同一核验限流窗口
+      //（同一 IP 每 10 分钟 20 次），防身份证枚举与截图接口滥用。
+      if (
+        (name === "verifyIdentity" || name === "submitPaymentScreenshot") &&
+        checkVerifyLimit(ip)
+      ) {
         tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
         return;
       }
