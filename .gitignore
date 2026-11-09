@@ -6,4 +6,5 @@ data/
 *.db.restored
 .env
 credentials.txt
+orkestr-env-values*.txt
 .gh-token

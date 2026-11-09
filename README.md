@@ -1,8 +1,8 @@
-# 港上资产执行系统 — 独立后端（orkestr 部署版）
+# 港上资产执行系统 — 独立后端
 
 真实后端（非演示桩）：案件台账、身份核验、聊天协商、还款确认、首页内容管理、
 数据统计、链接点击记录、还款意愿与年龄分段、登录手机号/地点记录，全部跑通。
-与已上线的 xray 节点装在同一个容器里（xray 透传、订阅链接不变）。
+纯后端部署，不含任何代理。
 
 ## 来源
 
@@ -10,8 +10,6 @@
   （`src/actions.ts` 约 60 个 action、`src/schema.ts`、drizzle 迁移 0001–0011）。
   只改了两处：① import 从 `@hatch/space-sdk` 换成本地 `src/shim.ts`；
   ② 见下文“与原版的一个修正”。
-- 容器与 xray 集成：沿用已验证的 orkestr 脚手架（Node 直接监听 `$PORT`、
-  WS 升级请求透传给本机 xray:10000、`/sub`、`/clash-meta.yaml`）。
 
 ## 与原版的一个修正（重要）
 
@@ -32,7 +30,7 @@ PORT=8080 DATA_DIR=./data ADMIN_BACKUP_TOKEN=自设令牌 bun src/server.ts
 ```
 
 - `GET /health` → `{"ok":true}`
-- `GET /` → 管理后台页（核验测试表单、订阅链接、备份下载）
+- `GET /` → 管理后台页（核验测试表单、备份下载）
 - `POST /actions` body `{"action":"接口名","args":{...}}` → `{"data":...}` /
   `{"error":"..."}`；公开接口：`getAuthStatus`、`setupPasswords`、`login`、
   `getSession`、`recordLinkClick`、`getSystemName`、`verifyIdentity`、
@@ -44,33 +42,24 @@ PORT=8080 DATA_DIR=./data ADMIN_BACKUP_TOKEN=自设令牌 bun src/server.ts
 - 首次打开先调 `setupPasswords` 设管理员+用户密码（PBKDF2 加盐哈希，
   会话 7 天），之后调 `login` 拿 token。
 
-## 部署到 orkestr（控制台操作）
+## 部署（控制台操作）
 
 1. GitHub 建公开仓 `ty128544b/gangshang-backend`，把本目录推上去
    （不要把任何密码/密钥写进仓库；`.gitignore` 已排除 `data/`、
    `node_modules/`、`.env`、`*.db`）。
-2. orkestr 控制台打开项目 `gangshang-orkestr` → 部署设置：
-   把部署源改成这个 GitHub 仓库，`Dockerfile` 入口为仓库根目录的
-   `Dockerfile`（构建命令留空，用 Dockerfile 构建；若控制台要求
-   填构建命令，填 `bun install --frozen-lockfile --production`，
-   启动命令留空——入口在 `entrypoint.sh`）。
-3. 环境变量（Deployments → Environment / Variables）：
-   - `PORT=8080`（orkestr 注入的端口，以控制台为准）
-   - `XRAY_UUID`：沿用现有值（与当前线上节点一致，勿改）
-   - `XRAY_WS_PATH`：沿用现有值（与当前线上节点一致，勿改）
-   - `CLOADY_SERVER` / `CLOADY_UUID` / `CLOADY_PATH`：
-     合并订阅里的 Cloady 节点参数（沿用现有值；留空则订阅只含本节点）
+2. 平台控制台建应用，部署源改成这个 GitHub 仓库，`Dockerfile.backend`
+   为入口（构建命令留空，用 Dockerfile 构建；启动命令 `bun src/server.ts`，
+   入口在 `entrypoint.sh`）。
+3. 环境变量：
+   - `PORT=8080`（平台注入的端口，以控制台为准）
    - `ADMIN_BACKUP_TOKEN`：自设一个强令牌（备份/恢复用；留空则禁用）
    - `DATA_DIR`：默认 `/srv/app/data`，一般不用改
-4. 重新部署。部署后验证：
-   - `GET https://gangshang-orkestr.orkestr.run/health` → `{"ok":true}`
-   - `GET https://gangshang-orkestr.orkestr.run/` → 管理后台页 200
-   - `POST https://gangshang-orkestr.orkestr.run/api/verify`
+4. 重新部署。部署后验证（把 `https://<后端域名>` 换成实际地址）：
+   - `GET https://<后端域名>/health` → `{"ok":true}`
+   - `GET https://<后端域名>/` → 管理后台页 200
+   - `POST https://<后端域名>/api/verify`
      `{"idCard":"<台账里真实身份证号>","phone":"<手机号>"}` →
      `verified:true` 且响应里没有 `demo`
-   - 订阅仍可用：`GET /clash-meta.yaml`、`GET /sub`
-   - xray 拨测：真实客户端连 `xray-orkestr` 节点，`generate_204` 应为 204，
-     出口 IP 应为 OVH Strasbourg（57.128.25.154 段）
 
 ## Netlify 前端改动（改 3 处，同一行）
 
@@ -86,7 +75,7 @@ PORT=8080 DATA_DIR=./data ADMIN_BACKUP_TOKEN=自设令牌 bun src/server.ts
 全部改成绝对地址
 
 ```
-https://gangshang-orkestr.orkestr.run/actions
+https://<后端域名>/actions
 ```
 
 三处位置（按当前文件）：约第 441 行（首页内容加载）、约第 971 行
@@ -99,7 +88,7 @@ https://gangshang-orkestr.orkestr.run/actions
 
 - 数据库是 SQLite 单文件 `$DATA_DIR/gangshang.db`（libsql + drizzle），
   启动时自动跑完 11 个迁移。
-- **容器文件系统不保证持久**：orkestr 免费档休眠/重新部署可能丢数据。
+- **容器文件系统不保证持久**：免费档休眠/重新部署可能丢数据。
   免费 Postgres add-on 已坏（一直 error、删不掉、占着唯一免费名额），
   所以目前不走它；更耐久的办法是接外部免费 Postgres（Supabase/Neon），
   属于后续升级项。
@@ -122,8 +111,7 @@ https://gangshang-orkestr.orkestr.run/actions
   高/中/低推导仍按原逻辑工作。后续接 LLM 时只改 `src/inference.ts`
   一个文件（按 zod schema 校验输出）。
 - **React 管理后台未移植**：原版管理界面是空间 React 客户端；这里
-  只提供一个轻量管理页（`src/admin.html`：健康状态、核验测试、
-  订阅链接、备份下载）。案件台账的增删改查、Excel 导入、聊天、
+  只提供一个轻量管理页（`src/admin.html`：健康状态、核验测试、备份下载）。案件台账的增删改查、Excel 导入、聊天、
   还款确认等操作走 `/actions` 接口（可用 `login` 拿到的 admin
   token 调用）。后续可再移植完整管理 UI。
 - 截图上传用本地文件存储（`$DATA_DIR/blobs/`），通过 `/blobs/<key>`

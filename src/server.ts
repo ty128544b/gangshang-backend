@@ -1,9 +1,7 @@
 // 港上后端独立部署入口（Bun + node:http）。
 // 路由：
 //   GET  /health            健康检查
-//   GET  /                  管理后台页（验证版：核验测试、订阅链接、备份下载）
-//   GET  /clash-meta.yaml   合并订阅（Cloady + orkestr xray 节点，域名取 Host 头）
-//   GET  /sub               小火箭订阅
+//   GET  /                  管理后台页（验证版：核验测试、备份下载）
 //   POST /actions           空间风格分发：{action, args, actionCallId} -> {data} / {error}
 //                          （Netlify 前端现有调用格式，原样兼容）
 //   POST /api/<action>      直接分发：body 即 args -> {data} / {error}
@@ -13,8 +11,7 @@
 //   GET  /blobs/*           还款截图等本地 blob 下载
 //   GET  /admin/backup      下载 SQLite 库文件（需 ADMIN_BACKUP_TOKEN）
 //   POST /admin/restore     上传 SQLite 库文件，重启后生效（需 ADMIN_BACKUP_TOKEN）
-//   WS   <WS_PATH>          Upgrade 请求裸 TCP 透传给本机 xray(10000)
-// 跨域：前端在 Netlify、后端在 orkestr，只放行 Netlify 与本后台 artifact
+// 跨域：前端在 Netlify、后端在独立服务器，只放行 Netlify 与本后台 artifact
 // 域名（含 x-request-id / authorization 请求头），并处理 OPTIONS 预检。
 // 无 Origin 头的请求（curl、服务端调用）不做跨域限制。
 import { createServer } from "node:http";
@@ -22,7 +19,6 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { connect as netConnect } from "node:net";
 import { Actions } from "./actions";
 import { checkpoint, dbFilePath, openDb, swapRestoredDb } from "./db";
 import { LocalBlobStore } from "./blobs";
@@ -196,102 +192,6 @@ function backupToken(
   return url.searchParams.get("token") || "";
 }
 
-// xray（环境变量，不进代码；orkestr 控制台里配）
-const XRAY_UUID = process.env.XRAY_UUID || "";
-const WS_PATH = process.env.XRAY_WS_PATH || "";
-const CLOADY_SERVER = process.env.CLOADY_SERVER || "";
-const CLOADY_UUID = process.env.CLOADY_UUID || "";
-const CLOADY_PATH = process.env.CLOADY_PATH || "";
-
-// ---------- 订阅（Cloady + orkestr 双节点；只配其一时只出那一个） ----------
-
-function clashYaml(host: string): string {
-  const nodes: string[] = [];
-  const group: string[] = [];
-  if (CLOADY_SERVER && CLOADY_UUID && CLOADY_PATH) {
-    nodes.push(`  - name: xray-usw1
-    type: vless
-    server: ${CLOADY_SERVER}
-    port: 443
-    uuid: ${CLOADY_UUID}
-    alterId: 0
-    cipher: auto
-    udp: true
-    tls: true
-    servername: ${CLOADY_SERVER}
-    network: ws
-    ws-opts:
-      path: ${CLOADY_PATH}
-      headers:
-        Host: ${CLOADY_SERVER}`);
-    group.push("      - xray-usw1");
-  }
-  if (XRAY_UUID && WS_PATH) {
-    nodes.push(`  - name: xray-orkestr
-    type: vless
-    server: ${host}
-    port: 443
-    uuid: ${XRAY_UUID}
-    alterId: 0
-    cipher: auto
-    udp: true
-    tls: true
-    servername: ${host}
-    network: ws
-    ws-opts:
-      path: ${WS_PATH}
-      headers:
-        Host: ${host}`);
-    group.push("      - xray-orkestr");
-  }
-  return `port: 7890
-socks-port: 7891
-allow-lan: true
-mode: rule
-log-level: info
-dns:
-  enable: true
-  ipv6: false
-  listen: 0.0.0.0:1053
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  fake-ip-filter:
-    - "*.lan"
-    - "*.local"
-    - "+.3gppnetwork.org"
-  nameserver:
-    - 8.8.8.8
-    - 1.1.1.1
-proxies:
-${nodes.join("\n")}
-proxy-groups:
-  - name: PROXY
-    type: select
-    proxies:
-${group.join("\n")}
-      - DIRECT
-rules:
-  - DOMAIN-SUFFIX,3gppnetwork.org,DIRECT
-  - MATCH,PROXY
-`;
-}
-
-function subLinks(host: string): string {
-  const enc = encodeURIComponent;
-  const lines: string[] = [];
-  if (CLOADY_SERVER && CLOADY_UUID && CLOADY_PATH) {
-    lines.push(
-      `vless://${CLOADY_UUID}@${CLOADY_SERVER}:443?encryption=none&security=tls&type=ws&host=${CLOADY_SERVER}&path=${enc(CLOADY_PATH)}#${enc("xray-usw1")}`,
-    );
-  }
-  if (XRAY_UUID && WS_PATH) {
-    lines.push(
-      `vless://${XRAY_UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&path=${enc(WS_PATH)}#${enc("xray-orkestr")}`,
-    );
-  }
-  return lines.join("\n") + "\n";
-}
-
 // ---------- 管理后台页 ----------
 
 function adminPage(): string {
@@ -408,7 +308,6 @@ function tooManyRequests(
 }
 
 const server = createServer(async (req, res) => {
-  const host = (req.headers.host || "").split(":")[0];
   const url = new URL(req.url || "/", "http://x");
   const path = url.pathname;
 
@@ -427,18 +326,6 @@ const server = createServer(async (req, res) => {
     applyHeaders(req, res);
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(adminPage());
-    return;
-  }
-  if (req.method === "GET" && path === "/clash-meta.yaml") {
-    applyHeaders(req, res);
-    res.writeHead(200, { "Content-Type": "text/yaml; charset=utf-8" });
-    res.end(clashYaml(host));
-    return;
-  }
-  if (req.method === "GET" && path === "/sub") {
-    applyHeaders(req, res);
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end(subLinks(host));
     return;
   }
   if (req.method === "GET" && path.startsWith("/blobs/")) {
@@ -679,45 +566,6 @@ const server = createServer(async (req, res) => {
   applyHeaders(req, res);
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("not found\n");
-});
-
-// VLESS+WS：把 Upgrade 请求原样重建后裸 TCP 透传给本机 xray(10000)，
-// 由 xray 自己完成 WebSocket 握手（与原脚手架 server.js 同一套做法）。
-server.on("upgrade", (req, socket, head) => {
-  let pathname = "";
-  try {
-    pathname = new URL(req.url || "", "http://x").pathname;
-  } catch {
-    /* ignore */
-  }
-  if (pathname !== WS_PATH || !WS_PATH) {
-    socket.destroy();
-    return;
-  }
-  const upstream = netConnect(10000, "127.0.0.1", () => {
-    const lines = [`${req.method} ${req.url} HTTP/1.1`];
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
-    }
-    upstream.write(lines.join("\r\n") + "\r\n\r\n");
-    if (head && head.length) upstream.write(head);
-    socket.pipe(upstream);
-    upstream.pipe(socket);
-  });
-  const kill = () => {
-    try {
-      socket.destroy();
-    } catch {
-      /* ignore */
-    }
-    try {
-      upstream.destroy();
-    } catch {
-      /* ignore */
-    }
-  };
-  upstream.on("error", kill);
-  socket.on("error", kill);
 });
 
 server.listen(PORT, "0.0.0.0", () => {

@@ -5513,7 +5513,7 @@ const ADMIN_ONLY_ACTIONS: ReadonlySet<string> = new Set([
 type AnyActionDef = ActionDefinition<z.ZodType, z.ZodType>;
 
 /* 守卫拒绝文案与 HTTP 状态码的契约（文案一字不可改）：
-   前端实际调用的生产后端（Orkestr 上的 gangshang-backend，其 src/actions.ts
+   前端实际调用的生产后端（独立部署的 gangshang-backend，其 src/actions.ts
    与本文件同步）在分发层按错误文案给这两类拒绝定状态码——含「未登录」→ 401，
    含「只认管理员」→ 403，其余错误 → 500。因此未登录文案必须含且只含
    「未登录」标记、权限不足文案必须含且只含「只认管理员」标记，两条文案

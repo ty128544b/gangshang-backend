@@ -1,7 +1,7 @@
 #!/bin/sh
 # 港上后端通用 VPS 部署脚本（有 shell 的真服务器用；无 Docker 也能跑）。
-# 用法：先把环境变量写进 /opt/gangshang-backend/.env（PORT、CLOADY_SERVER、
-# CLOADY_UUID、CLOADY_PATH、ADMIN_BACKUP_TOKEN），再执行本脚本。
+# 用法：先把环境变量写进 /opt/gangshang-backend/.env（PORT、
+# ADMIN_BACKUP_TOKEN），再执行本脚本。
 # 脚本会：装 Bun（如没有）→ 拉取/更新仓库 → bun install → 用 systemd 常驻
 # （无 systemd 则 nohup 后台 + @reboot 自启）→ 拨测 /health。
 # 敏感值只读 .env，不进脚本、不进日志。
@@ -13,7 +13,7 @@ BRANCH="${BRANCH:-main}"
 ENV_FILE="${ENV_FILE:-$APP_DIR/.env}"
 
 if [ ! -f "$ENV_FILE" ]; then
-  echo "缺 .env：先写 $ENV_FILE（PORT、CLOADY_SERVER、CLOADY_UUID、CLOADY_PATH、ADMIN_BACKUP_TOKEN）" >&2
+  echo "缺 .env：先写 $ENV_FILE（PORT、ADMIN_BACKUP_TOKEN）" >&2
   exit 1
 fi
 set -a; . "$ENV_FILE"; set +a
