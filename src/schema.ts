@@ -15,6 +15,13 @@ export const cases = sqliteTable("cases", {
   note: text("note").notNull().default(""),
   needsHuman: integer("needs_human").notNull().default(0),
   humanNote: text("human_note").notNull().default(""),
+  // 人工接管时间戳：null = 机器人值守（债务人页按话术自动回复），
+  // 有值 = 管理员已人工接管（债务人页机器人停答、显示专员在线）。
+  humanTakeoverAt: integer("human_takeover_at", { mode: "timestamp_ms" }),
+  // 禁言时间戳：null = 未禁言，有值 = 已禁言（债务人发不出消息，
+  // sendDebtorMessage 直接拒绝）。禁言只能由管理员手动设置/解除，
+  // 没有自动禁言；刷屏由发送限流挡（超限返回限流文案）。
+  mutedAt: integer("muted_at", { mode: "timestamp_ms" }),
   status: text("status", { enum: ["draft", "sent"] })
     .notNull()
     .default("draft"),
@@ -61,6 +68,7 @@ export const chatMessages = sqliteTable("chat_messages", {
     .default("debtor"),
   text: text("text").notNull(),
   analysis: text("analysis").notNull().default(""),
+  // 客服（我方）随消息发送的图片在 blobs 里的键；无图消息为 null。
   imageBlobKey: text("image_blob_key"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
@@ -292,6 +300,31 @@ export const verifyAttempts = sqliteTable("verify_attempts", {
 export const systemSettings = sqliteTable("system_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   systemName: text("system_name").notNull().default(""),
+});
+
+/* ---------------- 聊天话术（债务人页协商机器人脚本） ---------------- */
+
+// 后台「话术设置」保存的整套话术，一张表统一存六类行：
+// kind=rule 关键词规则（rule_key 标识、pattern 正则、analysis 分析备注、
+// reply 回复、sort_order 匹配顺序）；kind=opening 开场白（reply 存句子，
+// sort_order 区分第几句）；kind=offer 账单页协商方案文案（reply 存文案，
+// 单行）；kind=fallback 兜底回复（analysis + reply，单行）；
+// kind=chip 快捷按钮（reply 存按钮标签、analysis 存点击后发出的那句话、
+// sort_order 区分第几个）；kind=setting 单项文案（rule_key 存字段路径，
+// 如 chatTitle、payCard.note，reply 存文案，单字段一行）。
+// 表为空 = 后台从未保存过，getChatScripts 返回内置默认话术。
+export const chatScripts = sqliteTable("chat_scripts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  kind: text("kind", {
+    enum: ["rule", "opening", "offer", "fallback", "chip", "setting"],
+  })
+    .notNull()
+    .default("rule"),
+  ruleKey: text("rule_key").notNull().default(""),
+  pattern: text("pattern").notNull().default(""),
+  analysis: text("analysis").notNull().default(""),
+  reply: text("reply").notNull().default(""),
+  sortOrder: integer("sort_order").notNull().default(0),
 });
 
 /* ---------------- 账单示例 / 演示账单（单例） ---------------- */
