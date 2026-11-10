@@ -120,6 +120,13 @@
       "when": 1794225161355,
       "tag": "0017_add_operators_assignees_and_actors",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1794278269715,
+      "tag": "0018_add_corporate_account",
+      "breakpoints": true
     }
   ]
 }

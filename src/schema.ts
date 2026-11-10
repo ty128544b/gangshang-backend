@@ -241,6 +241,18 @@ export const paymentSettings = sqliteTable("payment_settings", {
   note: text("note").notNull().default(""),
 });
 
+/* ---------------- 首页对公账号设置（单例） ---------------- */
+/* 首页收款区填公司对公账号，与聊天付款卡（专员收款方式）分开设置、
+   分开保存。债务人页首页收款户名/开户银行/收款账号/收款二维码从这里取。 */
+
+export const corporateAccount = sqliteTable("corporate_account", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  payeeName: text("payee_name").notNull().default(""),
+  bankName: text("bank_name").notNull().default(""),
+  accountNo: text("account_no").notNull().default(""),
+  qrImageUrl: text("qr_image_url").notNull().default(""),
+});
+
 /* ---------------- 短信链接点击记录 ---------------- */
 
 // 债务人点开短信链接时由债务人网页调用 recordLinkClick 记一条；

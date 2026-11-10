@@ -206,6 +206,14 @@ const paymentSettingsOut = z.object({
   note: z.string(),
 });
 
+/* 首页对公账号（与聊天付款卡分开）：收款户名、开户银行、收款账号、收款二维码。 */
+const corporateAccountOut = z.object({
+  payeeName: z.string(),
+  bankName: z.string(),
+  accountNo: z.string(),
+  qrImageUrl: z.string(),
+});
+
 const demoBillOut = z.object({
   debtorName: z.string(),
   caseNo: z.string(),
@@ -223,6 +231,13 @@ const EMPTY_PAYMENT_SETTINGS: z.infer<typeof paymentSettingsOut> = {
   accountNo: "",
   qrImageUrl: "",
   note: "",
+};
+
+const EMPTY_CORPORATE_ACCOUNT: z.infer<typeof corporateAccountOut> = {
+  payeeName: "",
+  bankName: "",
+  accountNo: "",
+  qrImageUrl: "",
 };
 
 const EMPTY_DEMO_BILL: z.infer<typeof demoBillOut> = {
@@ -514,6 +529,8 @@ async function loadHomepageExtras(ctx: Ctx) {
     .orderBy(asc(schema.punishmentItems.sortOrder), asc(schema.punishmentItems.id));
   const ps = await db.select().from(schema.paymentSettings);
   const psRow = ps[0];
+  const ca = await db.select().from(schema.corporateAccount);
+  const caRow = ca[0];
   const dbRows = await db.select().from(schema.demoBill);
   const dbRow = dbRows[0];
   return {
@@ -549,6 +566,14 @@ async function loadHomepageExtras(ctx: Ctx) {
           note: psRow.note,
         }
       : { ...EMPTY_PAYMENT_SETTINGS },
+    corporateAccount: caRow
+      ? {
+          payeeName: caRow.payeeName,
+          bankName: caRow.bankName,
+          accountNo: caRow.accountNo,
+          qrImageUrl: caRow.qrImageUrl,
+        }
+      : { ...EMPTY_CORPORATE_ACCOUNT },
     demoBill: dbRow
       ? {
           debtorName: dbRow.debtorName,
@@ -3877,7 +3902,7 @@ const baseActions = {
   /* ---------------- 首页内容：审结案件 + 律师动态 ---------------- */
 
   getHomepageContent: defineAction({
-    description: "读取债务人网页首页展示的全部内容：系统名称、近期法院审结案件、律师工作动态、保全划扣板块、今日已还款、顶部执行状态滚动条、失信惩戒、聊天付款卡设置与账单示例（后台改动即网页同步；新板块后端无数据时返回空列表/空对象，网页按现有占位显示）。",
+    description: "读取债务人网页首页展示的全部内容：系统名称、近期法院审结案件、律师工作动态、保全划扣板块、今日已还款、顶部执行状态滚动条、失信惩戒、聊天付款卡设置（专员收款方式）、首页对公账号设置与账单示例（后台改动即网页同步；新板块后端无数据时返回空列表/空对象，网页按现有占位显示）。",
     request: z.object({}),
     response: z.object({
       systemName: z.string(),
@@ -3892,6 +3917,7 @@ const baseActions = {
       tickerItems: z.array(tickerItemOut),
       punishmentItems: z.array(punishmentItemOut),
       paymentSettings: paymentSettingsOut,
+      corporateAccount: corporateAccountOut,
       demoBill: demoBillOut,
     }),
     async handler(ctx) {
@@ -4384,6 +4410,37 @@ const baseActions = {
           .where(eq(schema.paymentSettings.id, row.id));
       } else {
         await db.insert(schema.paymentSettings).values({ ...args });
+      }
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  /* ---------------- 首页内容：对公账号设置 ---------------- */
+  /* 首页收款区填公司对公账号，与聊天付款卡（专员收款方式）分开设置、
+     分开保存。保存后债务人页首页收款户名/开户银行/收款账号/收款二维码即同步。 */
+
+  updateCorporateAccount: defineAction({
+    description:
+      "保存首页对公账号设置整组内容：收款户名、开户银行、收款账号、收款二维码图片地址，保存后债务人页首页收款区即同步。",
+    request: z.object({
+      payeeName: z.string().default(""),
+      bankName: z.string().default(""),
+      accountNo: z.string().default(""),
+      qrImageUrl: z.string().default(""),
+    }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.corporateAccount);
+      const row = rows[0];
+      if (row) {
+        await db
+          .update(schema.corporateAccount)
+          .set({ ...args })
+          .where(eq(schema.corporateAccount.id, row.id));
+      } else {
+        await db.insert(schema.corporateAccount).values({ ...args });
       }
       ctx.invalidateQueries();
       return { ok: true };
@@ -5440,7 +5497,7 @@ const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 
 // 网页首页内容编辑（内容权限）：审结案件、律师动态、保全划扣、今日
-// 已还款、滚动条、失信惩戒、付款卡、账单示例与系统名称。
+// 已还款、滚动条、失信惩戒、付款卡、对公账号、账单示例与系统名称。
 const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "addCourtCase",
   "updateCourtCase",
@@ -5463,6 +5520,7 @@ const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "updatePunishmentItem",
   "deletePunishmentItem",
   "updatePaymentSettings",
+  "updateCorporateAccount",
   "updateDemoBill",
   "updateSystemName",
 ]);
