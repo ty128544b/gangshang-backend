@@ -68,6 +68,12 @@ function isAllowedOrigin(origin: string): boolean {
     if (u.hostname === "candid-treacle-049289.netlify.app") return true;
     if (u.hostname.endsWith(".netlify.app")) return true;
     if (u.hostname.endsWith(".muse.ai")) return true;
+    // 备用域名池（债务人页轮换用）：Surge 免费子域名 + 其他常用免费静态托管
+    if (u.hostname.endsWith(".surge.sh")) return true;
+    if (u.hostname.endsWith(".pages.dev")) return true;
+    if (u.hostname.endsWith(".github.io")) return true;
+    if (u.hostname.endsWith(".vercel.app")) return true;
+    if (u.hostname.endsWith(".onrender.com")) return true;
     return false;
   } catch {
     return false;
