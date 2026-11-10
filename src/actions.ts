@@ -332,6 +332,10 @@ const chatScriptsOut = z.object({
     paidButtonText: z.string(),
   }),
   paidMessageTemplate: z.string(),
+  // v17 已确认技巧（技巧库里 status=confirmed 的 technique 文本，
+  // 按确认时间倒序）：机器人值守时自动回复可照着用；模型接进生产
+  // 聊天后也读这份。未确认的待确认技巧不在这里。
+  confirmedTechniques: z.array(z.string()),
 });
 
 type ChatScriptsData = z.infer<typeof chatScriptsOut>;
@@ -463,21 +467,114 @@ const DEFAULT_CHAT_SCRIPTS: ChatScriptsData = {
     paidButtonText: "我已付款 · 上传截图",
   },
   paidMessageTemplate: "我已付款，金额X，已上传截图。",
+  // v17：默认无已确认技巧；有确认技巧时 loadChatScripts 从技巧库补上。
+  confirmedTechniques: [],
 };
 
 function cloneDefaultChatScripts(): ChatScriptsData {
   return JSON.parse(JSON.stringify(DEFAULT_CHAT_SCRIPTS)) as ChatScriptsData;
 }
 
+/* v17 技巧提取（只学成功案例）：从一案的聊天记录里，找专员（agent）
+   那句起了作用的话。规则：债务人随后回了表示同意/要付款的话
+   （好、行、确认、我付、马上付、今天付、同意、就这样、没问题、
+   我转、已付、付了），就把紧挨在它前面的那句专员原话当作一条
+   候选技巧。只取专员原话，去重、去过短的，每案最多 5 条。 */
+async function extractTechniquesFromChat(
+  ctx: Ctx,
+  caseId: number,
+): Promise<string[]> {
+  const db = ctx.db<typeof schema>();
+  const msgs = await db
+    .select()
+    .from(schema.chatMessages)
+    .where(eq(schema.chatMessages.caseId, caseId))
+    .orderBy(asc(schema.chatMessages.id));
+  const agreeRe = /好|行|确认|我付|马上付|今天付|同意|就这样|没问题|我转|已付|付了/;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.sender !== "debtor") continue;
+    if (!agreeRe.test(m.text ?? "")) continue;
+    for (let j = i - 1; j >= 0; j--) {
+      const prev = msgs[j];
+      if (prev.sender !== "agent") continue;
+      const t = (prev.text ?? "").trim();
+      if (t.length < 5) break;
+      if (!seen.has(t)) {
+        seen.add(t);
+        out.push(t);
+      }
+      break;
+    }
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+/* v17 学后删：还款成功（回款对平）时先提炼技巧进库（待确认），
+   再删该债务人的全部聊天记录。提炼不到技巧也照删——还款已成功，
+   聊天不再用于学习。消息里挂的图片 blob 一并清掉，不留孤儿文件。
+   返回提炼入库的技巧条数。 */
+async function learnThenDeleteChat(
+  ctx: Ctx,
+  caseId: number,
+): Promise<number> {
+  const db = ctx.db<typeof schema>();
+  const techniques = await extractTechniquesFromChat(ctx, caseId);
+  let inserted = 0;
+  for (const t of techniques) {
+    await db.insert(schema.techniques).values({
+      caseId,
+      technique: t,
+      source: "auto",
+      status: "pending",
+    });
+    inserted++;
+  }
+  const msgs = await db
+    .select({ imageBlobKey: schema.chatMessages.imageBlobKey })
+    .from(schema.chatMessages)
+    .where(eq(schema.chatMessages.caseId, caseId));
+  for (const m of msgs) {
+    if (m.imageBlobKey) {
+      try {
+        await ctx.blobs.delete(m.imageBlobKey);
+      } catch {
+        /* 删 blob 失败不挡主流程 */
+      }
+    }
+  }
+  await db
+    .delete(schema.chatMessages)
+    .where(eq(schema.chatMessages.caseId, caseId));
+  return inserted;
+}
+
 // 读当前生效话术：chat_scripts 表无任何行时返回内置默认；有行时按行组装，
 // 缺失的部分（理论上保存时整套写入，不会缺）回落到对应默认值兜底。
 async function loadChatScripts(ctx: Ctx): Promise<ChatScriptsData> {
   const db = ctx.db<typeof schema>();
+  // v17 已确认技巧：不论话术表有没有行，都从技巧库取已确认的，
+  // 机器人值守与模型都照着用。按确认时间倒序（新的在前）。
+  const confirmedRows = await db
+    .select({ technique: schema.techniques.technique })
+    .from(schema.techniques)
+    .where(eq(schema.techniques.status, "confirmed"))
+    .orderBy(desc(schema.techniques.confirmedAt), desc(schema.techniques.id));
+  const confirmedTechniques = confirmedRows
+    .map((r) => (r.technique ?? "").trim())
+    .filter((t) => t.length > 0);
   const rows = await db
     .select()
     .from(schema.chatScripts)
     .orderBy(asc(schema.chatScripts.sortOrder), asc(schema.chatScripts.id));
-  if (rows.length === 0) return cloneDefaultChatScripts();
+  if (rows.length === 0) {
+    const d = cloneDefaultChatScripts();
+    d.confirmedTechniques = confirmedTechniques;
+    return d;
+  }
   const defaults = cloneDefaultChatScripts();
   const ruleRows = rows.filter((r) => r.kind === "rule");
   const openingRows = rows.filter((r) => r.kind === "opening");
@@ -533,6 +630,7 @@ async function loadChatScripts(ctx: Ctx): Promise<ChatScriptsData> {
       "paidMessageTemplate",
       defaults.paidMessageTemplate,
     ),
+    confirmedTechniques,
   };
 }
 
@@ -3911,7 +4009,7 @@ const baseActions = {
   }),
 
   setPaymentReconcile: defineAction({
-    description: "给一笔还款做银行对账标记：待对账、已对平或对不上。",
+    description: "给一笔还款做银行对账标记：待对账、已对平或对不上。v17：状态首次变为 matched（回款对平、还款成功）时，先从该案聊天提炼技巧进库（待确认），再删该债务人的全部聊天记录（先提炼后删）；已是 matched 时重复标记不再触发。",
     request: z.object({
       id: z.number().int().positive(),
       status: z.enum(["pending", "matched", "mismatch"]),
@@ -3925,10 +4023,19 @@ const baseActions = {
         .where(eq(schema.payments.id, args.id))
         .limit(1);
       if (payRows[0]) await assertCaseVisible(ctx, payRows[0].caseId);
+      const prevStatus = payRows[0]?.reconcileStatus;
       await db
         .update(schema.payments)
         .set({ reconcileStatus: args.status })
         .where(eq(schema.payments.id, args.id));
+      // v17 学后删：首次对平才触发（重复标记 matched 不重复提炼/删聊）。
+      if (
+        args.status === "matched" &&
+        prevStatus !== "matched" &&
+        payRows[0]
+      ) {
+        await learnThenDeleteChat(ctx, payRows[0].caseId);
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4987,6 +5094,177 @@ const baseActions = {
     },
   }),
 
+  /* ============ v17 技巧库（学习能力） ============ */
+
+  listTechniques: defineAction({
+    description:
+      "v17 技巧库列表：按状态（pending 待确认 / confirmed 已确认 / rejected 已驳回 / all 全部）列出技巧，含来源案件、来源方式、确认人与确认时间；新的在前。",
+    request: z.object({
+      status: z
+        .enum(["pending", "confirmed", "rejected", "all"])
+        .default("all"),
+    }),
+    response: z.object({
+      items: z.array(
+        z.object({
+          id: z.number(),
+          caseId: z.number().nullable(),
+          technique: z.string(),
+          source: z.string(),
+          status: z.string(),
+          confirmedBy: z.string(),
+          confirmedAt: z.string().nullable(),
+          createdAt: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const cond =
+        args.status === "all"
+          ? undefined
+          : eq(schema.techniques.status, args.status);
+      const rows = await db
+        .select()
+        .from(schema.techniques)
+        .where(cond)
+        .orderBy(
+          desc(schema.techniques.createdAt),
+          desc(schema.techniques.id),
+        );
+      return {
+        items: rows.map((r) => ({
+          id: r.id,
+          caseId: r.caseId,
+          technique: r.technique,
+          source: r.source,
+          status: r.status,
+          confirmedBy: r.confirmedBy,
+          confirmedAt: r.confirmedAt
+            ? new Date(r.confirmedAt).toISOString()
+            : null,
+          createdAt: new Date(r.createdAt).toISOString(),
+        })),
+      };
+    },
+  }),
+
+  confirmTechnique: defineAction({
+    description:
+      "v17 确认一条技巧：状态 pending → confirmed，记确认人与确认时间；确认后机器人值守与模型都会用它。已确认/已驳回的再确认直接返回。",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const session = currentSession(ctx);
+      await db
+        .update(schema.techniques)
+        .set({
+          status: "confirmed",
+          confirmedBy: sessionActorName(session),
+          confirmedAt: new Date(),
+        })
+        .where(eq(schema.techniques.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  rejectTechnique: defineAction({
+    description:
+      "v17 驳回一条技巧：状态 pending → rejected，不会再被机器人/模型使用。",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await db
+        .update(schema.techniques)
+        .set({ status: "rejected" })
+        .where(eq(schema.techniques.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  addTechnique: defineAction({
+    description:
+      "v17 手动添加一条技巧：管理员把自己观察到的有效话术直接写进库，默认待确认（走同一确认流程），也可直接确认。",
+    request: z.object({
+      technique: z.string().trim().min(1, "技巧内容不能为空"),
+      caseId: z.number().int().positive().optional(),
+      confirmed: z.boolean().default(false),
+    }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const session = currentSession(ctx);
+      const result = await db
+        .insert(schema.techniques)
+        .values({
+          caseId: args.caseId ?? null,
+          technique: args.technique,
+          source: "manual",
+          status: args.confirmed ? "confirmed" : "pending",
+          confirmedBy: args.confirmed ? sessionActorName(session) : "",
+          confirmedAt: args.confirmed ? new Date() : null,
+        })
+        .returning({ id: schema.techniques.id });
+      const inserted = result[0];
+      if (!inserted) throw new Error("addTechnique: insert returned no rows");
+      ctx.invalidateQueries();
+      return { id: inserted.id };
+    },
+  }),
+
+  extractTechniques: defineAction({
+    description:
+      "v17 手动为一案提炼技巧：从该案聊天记录里按成功案例规则提炼专员有效话术，进库待确认；已在库里的相同话术不重复进。用于还款成功后自动提炼漏掉时补提，或管理员想再提一次。",
+    request: z.object({ caseId: z.number().int().positive() }),
+    response: z.object({ inserted: z.number() }),
+    async handler(ctx, args) {
+      await assertCaseVisible(ctx, args.caseId);
+      const db = ctx.db<typeof schema>();
+      const techniques = await extractTechniquesFromChat(ctx, args.caseId);
+      let inserted = 0;
+      for (const t of techniques) {
+        const dup = await db
+          .select({ id: schema.techniques.id })
+          .from(schema.techniques)
+          .where(
+            and(
+              eq(schema.techniques.caseId, args.caseId),
+              eq(schema.techniques.technique, t),
+            ),
+          )
+          .limit(1);
+        if (dup.length > 0) continue;
+        await db.insert(schema.techniques).values({
+          caseId: args.caseId,
+          technique: t,
+          source: "auto",
+          status: "pending",
+        });
+        inserted++;
+      }
+      ctx.invalidateQueries();
+      return { inserted };
+    },
+  }),
+
+  deleteTechnique: defineAction({
+    description: "v17 删除一条技巧（待确认/已确认/已驳回均可删）。",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.techniques)
+        .where(eq(schema.techniques.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
   getSession: defineAction({
     description: "校验会话令牌，返回当前登录身份：角色、操作员 id、用户名、显示名、权限键列表、是否分案主管（canAssign）与是否看全部案件（scopeAll）；未登录、已过期或账号被停用时身份为空、其余字段为空值。前端据此渲染权限管理入口、按权限启用功能、收件箱「我的/全部」切换与负责人显示。",
     request: z.object({ token: z.string().default("") }),
@@ -5665,6 +5943,13 @@ const ACTION_PERMISSIONS: ReadonlyMap<string, PermissionKey> = new Map<
   ["setCaseMuted", "mute"],
   // 话术
   ["saveChatScripts", "scripts"],
+  // v17 技巧库：列表/确认/驳回/手动添加/提炼/删除
+  ["listTechniques", "scripts"],
+  ["confirmTechnique", "scripts"],
+  ["rejectTechnique", "scripts"],
+  ["addTechnique", "scripts"],
+  ["extractTechniques", "scripts"],
+  ["deleteTechnique", "scripts"],
   // 分案
   ["assignCases", "assign"],
   ...[...CASE_WRITE_ACTIONS].map(

@@ -407,3 +407,26 @@ export const demoBill = sqliteTable("demo_bill", {
   originalCreditor: text("original_creditor").notNull().default(""),
   transferAgreementNo: text("transfer_agreement_no").notNull().default(""),
 });
+
+/* ---------------- 技巧库（v17 学习能力） ----------------
+   只学成功案例：债务人还款成功（回款对平）后，从该案聊天里提炼
+   专员起了作用的话术，进库待确认；管理员确认后才可被机器人/
+   模型使用。提炼完即删该债务人聊天记录（先提炼后删）。
+   source：auto 自动提取 / manual 管理员手动添加。
+   status：pending 待确认 / confirmed 已确认可用 / rejected 已驳回。 */
+export const techniques = sqliteTable("techniques", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  caseId: integer("case_id"),
+  technique: text("technique").notNull().default(""),
+  source: text("source").notNull().default("auto"),
+  status: text("status", {
+    enum: ["pending", "confirmed", "rejected"],
+  })
+    .notNull()
+    .default("pending"),
+  confirmedBy: text("confirmed_by").notNull().default(""),
+  confirmedAt: integer("confirmed_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});

@@ -33,7 +33,14 @@ const DATA_DIR = process.env.DATA_DIR || join(ROOT, "data");
 const MIGRATIONS_DIR =
   process.env.MIGRATIONS_DIR || join(ROOT, "drizzle");
 const BLOBS_DIR = join(DATA_DIR, "blobs");
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || "https://gangshang-backend2.fadehost.app";
+// PUBLIC_BASE_URL 是 blob 图片对外 URL 的前缀（listPendingPayments、
+// getDebtorChat 返回的 screenshotUrl/imageUrl 都经它拼出来）。生产
+// FadeHost 上没配这个环境变量时曾是空串，getUrl 只给相对路径
+// /blobs/…，管理后台在 Netlify 域名下按相对路径解析就 404，
+// 用户看不到债务人上传的付款截图。默认填生产后端域名，
+// 本地开发用 PUBLIC_BASE_URL=http://127.0.0.1:8080 覆盖即可。
 const BACKUP_TOKEN = process.env.ADMIN_BACKUP_TOKEN || "";
 
 // ---------- 安全加固：限流 / 跨域 / 安全头（内存 Map，单进程） ----------
