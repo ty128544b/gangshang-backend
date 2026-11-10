@@ -3371,15 +3371,21 @@ const baseActions = {
 
   sendDebtorMessage: defineAction({
     description:
-      "债务人端发送一条聊天消息（公开接口，无需登录令牌，债务人网页在身份核验通过后调用）：后端校验案件存在，且该案件台账上的身份证号与传来的 idCard 归一化后（去空格、转大写）一致，不一致直接拒绝；text 1–2000 字；写入 chat_messages（sender=debtor），后台聊天面板立即可见。限流与核验同口径：同一身份证号 10 分钟内最多 20 次（verify_attempts 表计数，被限流时抛限流文案，生产分发层按文案映射 429），全站 10 分钟 600 次兜底；生产 HTTP 层另按 IP 做同口径限流。返回新消息 id、创建时间与当前是否人工接管（humanTakeover，接管时债务人页本地机器人应停答）。写入后立即按 analyzeChatMessage 同一口径自动分析这条新消息（runDebtorMessageAnalysis，结果存回该消息的 analysis，该案还款意愿随之更新，管理员不必再手动点分析；收件箱轮询刷新即可看到新意愿），返回里同时带 analysis 与按 computeWillingness 口径算出的该案当前还款意愿 willingness；自动分析失败（模型不可用等）不影响消息发送本身，analysis 留空、willingness 按其余信号计算。",
+      "债务人端发送一条聊天消息（公开接口，无需登录令牌，债务人网页在身份核验通过后调用）：后端校验案件存在，且该案件台账上的身份证号与传来的 idCard 归一化后（去空格、转大写）一致，不一致直接拒绝；text 1–2000 字；可随消息附一张图片（image，可选，债务人发凭证/截图等）：只收图片、解码后不超过 5MB；文字与图片不能同时为空（纯图消息跳过自动分析）；写入 chat_messages（sender=debtor），后台聊天面板立即可见。限流与核验同口径：同一身份证号 10 分钟内最多 20 次（verify_attempts 表计数，被限流时抛限流文案，生产分发层按文案映射 429），全站 10 分钟 600 次兜底；生产 HTTP 层另按 IP 做同口径限流。返回新消息 id、创建时间与当前是否人工接管（humanTakeover，接管时债务人页本地机器人应停答）。写入后立即按 analyzeChatMessage 同一口径自动分析这条新消息（runDebtorMessageAnalysis，结果存回该消息的 analysis，该案还款意愿随之更新，管理员不必再手动点分析；收件箱轮询刷新即可看到新意愿），返回里同时带 analysis 与按 computeWillingness 口径算出的该案当前还款意愿 willingness；自动分析失败（模型不可用等）不影响消息发送本身，analysis 留空、willingness 按其余信号计算。",
     request: z.object({
       caseId: z.number().int().positive(),
       idCard: z.string().min(1, "身份证号不能为空"),
       text: z
         .string()
         .trim()
-        .min(1, "消息内容不能为空")
-        .max(2000, "消息最长 2000 字"),
+        .max(2000, "消息最长 2000 字")
+        .default(""),
+      image: z
+        .object({
+          dataBase64: z.string().min(1, "请上传图片"),
+          mimeType: z.string().regex(/^image\//, "图片必须是图片文件"),
+        })
+        .optional(),
     }),
     response: z.object({
       id: z.number(),
@@ -3414,9 +3420,27 @@ const baseActions = {
       if (row.mutedAt != null) {
         throw new Error("该账号已被禁言");
       }
+      // 文字与图片不能同时为空（与专员发消息同口径）；有图时文字可空。
+      const text = args.text ?? "";
+      if (!text.trim() && !args.image) {
+        throw new Error("消息内容不能为空");
+      }
+      let imageBytes: Buffer | null = null;
+      if (args.image) {
+        if (!args.image.mimeType.toLowerCase().startsWith("image/")) {
+          throw new Error("只支持发送图片，请重新选择。");
+        }
+        imageBytes = Buffer.from(args.image.dataBase64, "base64");
+        if (imageBytes.length === 0) {
+          throw new Error("图片内容为空，请重新选择。");
+        }
+        if (imageBytes.length > 5 * 1024 * 1024) {
+          throw new Error("HTTP400:图片文件过大，请上传 5MB 以内的图片");
+        }
+      }
       const result = await db
         .insert(schema.chatMessages)
-        .values({ caseId: row.id, sender: "debtor", text: args.text })
+        .values({ caseId: row.id, sender: "debtor", text })
         .returning({
           id: schema.chatMessages.id,
           createdAt: schema.chatMessages.createdAt,
@@ -3425,17 +3449,31 @@ const baseActions = {
       if (!inserted) {
         throw new Error("sendDebtorMessage: insert returned no rows");
       }
+      if (args.image && imageBytes) {
+        // 键名 = 消息ID + 32 位随机十六进制，与专员发图/付款截图同规则。
+        const key = `chat-images/${inserted.id}-${randomHex(16)}`;
+        await ctx.blobs.put(key, imageBytes, {
+          contentType: args.image.mimeType,
+        });
+        await db
+          .update(schema.chatMessages)
+          .set({ imageBlobKey: key })
+          .where(eq(schema.chatMessages.id, inserted.id));
+      }
       // 新消息自动分析：与管理员手动「分析这句」同一口径，分析写回消息后
       // 该案还款意愿（computeWillingness 解析分析文本）随之更新。分析失败
       // 不影响消息发送本身，analysis 留空，管理员仍可在面板手动补分析。
+      // 纯图消息无文字可分析，直接跳过。
       let analysis = "";
       try {
         analysis =
-          (await runDebtorMessageAnalysis(ctx, {
-            id: inserted.id,
-            caseId: row.id,
-            text: args.text,
-          })) ?? "";
+          text.trim()
+            ? (await runDebtorMessageAnalysis(ctx, {
+                id: inserted.id,
+                caseId: row.id,
+                text,
+              })) ?? ""
+            : "";
       } catch {
         analysis = "";
       }
