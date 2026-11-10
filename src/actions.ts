@@ -1456,6 +1456,7 @@ const loginOut = z.object({
 const chatInboxItemOut = z.object({
   caseId: z.number(),
   debtorName: z.string(),
+  debtorAvatarUrl: z.string(),
   caseNo: z.string(),
   totalDueCents: z.number(),
   overdueDays: z.number(),
@@ -2089,6 +2090,9 @@ const baseActions = {
         items.push({
           caseId: r.id,
           debtorName: r.debtorName,
+          debtorAvatarUrl: r.avatarBlobKey
+            ? ((await ctx.blobs.getUrl(r.avatarBlobKey)) ?? "")
+            : "",
           caseNo: r.caseNo,
           totalDueCents: r.totalDueCents,
           overdueDays: r.overdueDays,
@@ -3461,6 +3465,11 @@ const baseActions = {
       messages: z.array(debtorChatMessageOut),
       humanTakeover: z.boolean(),
       muted: z.boolean(),
+      // 聊天头用：债务人名字（前端脱敏后显示）、债务人头像、我方头像
+      //（负责人头像，无负责人时用主专员 user 的头像；未上传为空串）。
+      debtorName: z.string(),
+      debtorAvatarUrl: z.string(),
+      agentAvatarUrl: z.string(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -3485,9 +3494,34 @@ const baseActions = {
         .from(schema.chatMessages)
         .where(eq(schema.chatMessages.caseId, row.id))
         .orderBy(asc(schema.chatMessages.id));
+      // 我方头像：负责人（assignee）的头像；未分案时用主专员 user 的头像。
+      let agentKey: string | null = null;
+      if (row.assigneeId != null) {
+        const ops = await db
+          .select({ avatarBlobKey: schema.operators.avatarBlobKey })
+          .from(schema.operators)
+          .where(eq(schema.operators.id, row.assigneeId));
+        agentKey = ops[0]?.avatarBlobKey ?? null;
+      }
+      if (!agentKey) {
+        const ops = await db
+          .select({ avatarBlobKey: schema.operators.avatarBlobKey })
+          .from(schema.operators)
+          .where(eq(schema.operators.username, "user"));
+        agentKey = ops[0]?.avatarBlobKey ?? null;
+      }
+      const debtorAvatarUrl = row.avatarBlobKey
+        ? ((await ctx.blobs.getUrl(row.avatarBlobKey)) ?? "")
+        : "";
+      const agentAvatarUrl = agentKey
+        ? ((await ctx.blobs.getUrl(agentKey)) ?? "")
+        : "";
       return {
         humanTakeover: row.humanTakeoverAt != null,
         muted: row.mutedAt != null,
+        debtorName: row.debtorName ?? "",
+        debtorAvatarUrl,
+        agentAvatarUrl,
         messages: await Promise.all(
           messages.map(async (m) => ({
             id: m.id,
@@ -5265,6 +5299,135 @@ const baseActions = {
     },
   }),
 
+  // ---- 头像（2026-11-10）：专员与债务人各自可上传头像，聊天里显示 ----
+  // 专员头像挂在 operators 行上；管理员没有专员行，头像挂在 username="user"
+  // 的主专员行名下（管理员不聊天，聊天里显示的就是这张）。债务人头像挂在
+  // cases 行上。头像只收图片、2MB 以内，存 blobs：avatars/operator-<id>-<随机>
+  // 与 avatars/debtor-<caseId>-<随机>；旧头像文件不删除（键带随机串，不会覆盖）。
+  uploadMyAvatar: defineAction({
+    description:
+      "当前登录的专员/管理员上传自己的头像（只收图片、2MB 以内）：专员写自己的 operators 行，管理员写 username=user 的主专员行；返回新头像地址，聊天里我方消息即用这张。未登录、账号不存在时拒绝。",
+    request: z.object({
+      image: z.object({
+        dataBase64: z.string().min(1, "请上传图片"),
+        mimeType: z.string().regex(/^image\//, "图片必须是图片文件"),
+      }),
+    }),
+    response: z.object({ avatarUrl: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const session = currentSession(ctx);
+      if (!session) throw new Error(NOT_LOGGED_IN_MESSAGE);
+      let row: { id: number } | null = null;
+      if (session.operatorId != null) {
+        const rows = await db
+          .select({ id: schema.operators.id })
+          .from(schema.operators)
+          .where(eq(schema.operators.id, session.operatorId));
+        row = rows[0] ?? null;
+      } else {
+        // 管理员：头像挂主专员行。
+        const rows = await db
+          .select({ id: schema.operators.id })
+          .from(schema.operators)
+          .where(eq(schema.operators.username, "user"));
+        row = rows[0] ?? null;
+      }
+      if (!row) throw new Error("HTTP400:未找到当前账号，无法上传头像");
+      if (!args.image.mimeType.toLowerCase().startsWith("image/")) {
+        throw new Error("HTTP400:图片必须是图片文件");
+      }
+      const imageBytes = Buffer.from(args.image.dataBase64, "base64");
+      if (imageBytes.length > 2 * 1024 * 1024) {
+        throw new Error("HTTP400:图片文件过大，请上传 2MB 以内的图片");
+      }
+      const key = `avatars/operator-${row.id}-${randomHex(16)}`;
+      await ctx.blobs.put(key, imageBytes, {
+        contentType: args.image.mimeType,
+      });
+      await db
+        .update(schema.operators)
+        .set({ avatarBlobKey: key })
+        .where(eq(schema.operators.id, row.id));
+      ctx.invalidateQueries();
+      return { avatarUrl: (await ctx.blobs.getUrl(key)) ?? "" };
+    },
+  }),
+
+  getMyAvatar: defineAction({
+    description:
+      "返回当前登录账号的头像地址：专员读自己的 operators 行，管理员读 username=user 的主专员行；未上传返回空串，前端显示姓名首字。",
+    request: z.object({}),
+    response: z.object({ avatarUrl: z.string() }),
+    async handler(ctx, _args) {
+      const db = ctx.db<typeof schema>();
+      const session = currentSession(ctx);
+      if (!session) throw new Error(NOT_LOGGED_IN_MESSAGE);
+      let key: string | null = null;
+      if (session.operatorId != null) {
+        const rows = await db
+          .select({ avatarBlobKey: schema.operators.avatarBlobKey })
+          .from(schema.operators)
+          .where(eq(schema.operators.id, session.operatorId));
+        key = rows[0]?.avatarBlobKey ?? null;
+      } else {
+        const rows = await db
+          .select({ avatarBlobKey: schema.operators.avatarBlobKey })
+          .from(schema.operators)
+          .where(eq(schema.operators.username, "user"));
+        key = rows[0]?.avatarBlobKey ?? null;
+      }
+      return { avatarUrl: key ? ((await ctx.blobs.getUrl(key)) ?? "") : "" };
+    },
+  }),
+
+  uploadDebtorAvatar: defineAction({
+    description:
+      "债务人端上传自己的头像（公开接口，无需登录令牌，债务人页核验通过后调用）：校验案件存在且台账身份证号与传来的 idCard 归一化后一致；只收图片、2MB 以内；写 cases 行的 avatar_blob_key，返回新头像地址，聊天里债务人消息即用这张。",
+    request: z.object({
+      caseId: z.number().int().positive(),
+      idCard: z.string().min(1, "身份证号不能为空"),
+      image: z.object({
+        dataBase64: z.string().min(1, "请上传图片"),
+        mimeType: z.string().regex(/^image\//, "图片必须是图片文件"),
+      }),
+    }),
+    response: z.object({ avatarUrl: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const idCardNorm = (args.idCard ?? "").replace(/\s+/g, "").toUpperCase();
+      const rows = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, args.caseId));
+      const row = rows[0];
+      if (!row) {
+        throw new Error("HTTP400:未找到匹配的案件记录");
+      }
+      const ledgerNorm = (row.idCard ?? "").replace(/\s+/g, "").toUpperCase();
+      if (!ledgerNorm || ledgerNorm !== idCardNorm) {
+        throw new Error("HTTP400:身份证号与案件不匹配");
+      }
+      if (!args.image.mimeType.toLowerCase().startsWith("image/")) {
+        throw new Error("HTTP400:图片必须是图片文件");
+      }
+      const imageBytes = Buffer.from(args.image.dataBase64, "base64");
+      if (imageBytes.length > 2 * 1024 * 1024) {
+        throw new Error("HTTP400:图片文件过大，请上传 2MB 以内的图片");
+      }
+      const key = `avatars/debtor-${row.id}-${randomHex(16)}`;
+      await ctx.blobs.put(key, imageBytes, {
+        contentType: args.image.mimeType,
+      });
+      await db
+        .update(schema.cases)
+        .set({ avatarBlobKey: key })
+        .where(eq(schema.cases.id, row.id));
+      ctx.invalidateQueries();
+      return { avatarUrl: (await ctx.blobs.getUrl(key)) ?? "" };
+    },
+  }),
+
   getSession: defineAction({
     description: "校验会话令牌，返回当前登录身份：角色、操作员 id、用户名、显示名、权限键列表、是否分案主管（canAssign）与是否看全部案件（scopeAll）；未登录、已过期或账号被停用时身份为空、其余字段为空值。前端据此渲染权限管理入口、按权限启用功能、收件箱「我的/全部」切换与负责人显示。",
     request: z.object({ token: z.string().default("") }),
@@ -5852,6 +6015,7 @@ const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "submitPaymentScreenshot",
   "getDebtorChat",
   "sendDebtorMessage",
+  "uploadDebtorAvatar",
   "getChatScripts",
 ]);
 
@@ -5868,6 +6032,7 @@ const READ_ACTIONS: ReadonlySet<string> = new Set([
   "getPaymentScreenshot",
   "getHomepageContent",
   "listAssignees",
+  "getMyAvatar",
   "getOperatorPerformance",
 ]);
 
@@ -5950,6 +6115,8 @@ const ACTION_PERMISSIONS: ReadonlyMap<string, PermissionKey> = new Map<
   ["addTechnique", "scripts"],
   ["extractTechniques", "scripts"],
   ["deleteTechnique", "scripts"],
+  // 头像：我方头像用聊天权限（头像显示在聊天里）。
+  ["uploadMyAvatar", "chat"],
   // 分案
   ["assignCases", "assign"],
   ...[...CASE_WRITE_ACTIONS].map(

@@ -28,6 +28,8 @@ export const cases = sqliteTable("cases", {
   // 自己的案件（未分配的也看不到）；管理员与有分案权限的操作员
   // （分案主管）看全部。分派只能由管理员或分案主管手动指定/改派。
   assigneeId: integer("assignee_id"),
+  // 债务人头像在 blobs 里的键；null = 未上传，聊天里显示姓名首字。
+  avatarBlobKey: text("avatar_blob_key"),
   status: text("status", { enum: ["draft", "sent"] })
     .notNull()
     .default("draft"),
@@ -337,6 +339,8 @@ export const operators = sqliteTable("operators", {
   disabled: integer("disabled").notNull().default(0),
   failCount: integer("fail_count").notNull().default(0),
   lockedUntil: integer("locked_until").notNull().default(0),
+  // 专员头像在 blobs 里的键；null = 未上传，聊天里显示姓名首字。
+  avatarBlobKey: text("avatar_blob_key"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

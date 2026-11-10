@@ -148,6 +148,13 @@
       "when": 1794292069463,
       "tag": "0021_add_techniques",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1794293967168,
+      "tag": "0022_add_avatar_blob_key",
+      "breakpoints": true
     }
   ]
 }
