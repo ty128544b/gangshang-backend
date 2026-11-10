@@ -6,7 +6,7 @@ import {
   type Ctx,
   type SpaceDb,
 } from "./shim";
-import { asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 const caseFields = {
@@ -2720,7 +2720,7 @@ const baseActions = {
         return { found: false, matchedByIdCard: false, phoneChanged: false, case: null };
       }
       // 核验限流（库表持久化，串行检查+记入，防并发超发）。
-      await checkVerifyRateLimit(db, idCardNorm, phoneNorm);
+      await checkVerifyRateLimit(db, idCardNorm, phoneNorm, "verify");
       const rows = await db
         .select()
         .from(schema.cases)
@@ -3368,8 +3368,7 @@ const baseActions = {
       const db = ctx.db<typeof schema>();
       // 身份证号归一化：去全部空格、转大写，与台账比对时大小写和空格不敏感。
       const idCardNorm = (args.idCard ?? "").replace(/\s+/g, "").toUpperCase();
-      // 限流与核验同口径（库表持久化，串行检查+记入，防并发超发）。
-      await checkVerifyRateLimit(db, idCardNorm, "");
+
       // 校验：案件必须存在，且台账身份证号与传来的身份证号归一化后一致。
       const rows = await db
         .select()
@@ -3437,8 +3436,7 @@ const baseActions = {
       const db = ctx.db<typeof schema>();
       // 身份证号归一化：去全部空格、转大写，与台账比对时大小写和空格不敏感。
       const idCardNorm = (args.idCard ?? "").replace(/\s+/g, "").toUpperCase();
-      // 限流与核验同口径（库表持久化，串行检查+记入，防并发超发）。
-      await checkVerifyRateLimit(db, idCardNorm, "");
+
       // 校验：案件必须存在，且台账身份证号与传来的身份证号归一化后一致。
       const rows = await db
         .select()
@@ -3867,7 +3865,7 @@ const baseActions = {
         throw new Error("只支持上传图片，请重新选择付款截图。");
       }
       // 限流与核验同口径（库表持久化，串行检查+记入，防并发超发）。
-      await checkVerifyRateLimit(db, idCardNorm, "");
+      await checkVerifyRateLimit(db, idCardNorm, "", "payment");
       // 双重校验：案件必须存在，且台账身份证号与传来的身份证号归一化后一致。
       const rows = await db
         .select()
@@ -4817,7 +4815,7 @@ const baseActions = {
       if (
         hitRateLimit(
           "chatScripts:global",
-          VERIFY_GLOBAL_MAX_PER_WINDOW,
+          600,
           VERIFY_WINDOW_MS,
         )
       ) {
@@ -5716,14 +5714,24 @@ const RATE_LIMIT_MESSAGE = "操作过于频繁，请稍后再试。";
    action 运行环境拿不到请求 IP，这里按会话令牌（公开接口按业务键）
    做进程内限流作为兜底；按 IP 的限流在生产 HTTP 层执行（见 DATA-PLAN）。 */
 
-/* 债务人核验限流口径：同一身份证号或同一手机号，10 分钟内最多核验 20 次
-   （verify_attempts 表计数）；全站 10 分钟总量上限 600 次兜底防扫描。
-   生产 HTTP 层另按 IP 做同口径（同 IP 10 分钟 20 次）限流。 */
+/* 债务人限流口径（用户 2026-11-10 亲定：债务人跟用户聊天不应该出现频繁
+   限制，除非用户禁言债务人）：
+   - 聊天（发消息 sendDebtorMessage、拉取聊天 getDebtorChat）不做任何频率
+     限制，不调 checkVerifyRateLimit；唯一的管控是管理员/用户手动禁言
+     （setCaseMuted，禁言后发送直接拒绝「该账号已被禁言」）。
+   - 只剩两类动作还限流（按 kind 分桶，互不抢额度）：
+     verify：核验身份，同一身份证号或同一手机号 10 分钟 20 次（防爆破身份证号）；
+     payment：传付款截图，同一身份证号 10 分钟 20 次。
+   全站总量上限按 kind 各算（600 次/10 分钟，防扫描）。生产 HTTP 层另按 IP
+   做同口径限流（核验与传截图）。 */
 const VERIFY_WINDOW_MS = 10 * 60 * 1000;
-const VERIFY_MAX_PER_WINDOW = 20;
-const VERIFY_GLOBAL_MAX_PER_WINDOW = 600;
+const RATE_LIMITS = {
+  verify: { max: 20, globalMax: 600 },
+  payment: { max: 20, globalMax: 600 },
+} as const;
+type RateLimitKind = keyof typeof RATE_LIMITS;
 
-// 核验限流（库表持久化）：先数最近 10 分钟的尝试再决定放不放行；
+// 核验限流（库表持久化）：先数最近 10 分钟同 kind 的尝试再决定放不放行；
 // 被限流的尝试不再记入，避免窗口被堵后无限延长；顺带清理窗口外旧记录。
 // 身份证号归一化比对（去全部空格、转大写）；手机号有值时也按手机号计数。
 // 检查+记入必须串行：并发下先查后插会互相看不到计数，导致同一窗口内超发
@@ -5733,9 +5741,10 @@ function checkVerifyRateLimit(
   db: SpaceDb<typeof schema>,
   idCardNorm: string,
   phoneNorm: string,
+  kind: RateLimitKind,
 ): Promise<void> {
   const run = verifyLimitQueue.then(() =>
-    checkVerifyRateLimitInner(db, idCardNorm, phoneNorm),
+    checkVerifyRateLimitInner(db, idCardNorm, phoneNorm, kind),
   );
   verifyLimitQueue = run.then(
     () => undefined,
@@ -5748,12 +5757,19 @@ async function checkVerifyRateLimitInner(
   db: SpaceDb<typeof schema>,
   idCardNorm: string,
   phoneNorm: string,
+  kind: RateLimitKind,
 ): Promise<void> {
+  const limits = RATE_LIMITS[kind];
   const windowStart = new Date(Date.now() - VERIFY_WINDOW_MS);
   const recentAttempts = await db
     .select()
     .from(schema.verifyAttempts)
-    .where(gt(schema.verifyAttempts.createdAt, windowStart));
+    .where(
+      and(
+        gt(schema.verifyAttempts.createdAt, windowStart),
+        eq(schema.verifyAttempts.kind, kind),
+      ),
+    );
   const norm = (v: string | null | undefined) =>
     (v ?? "").replace(/\s+/g, "").toUpperCase();
   const idAttempts = recentAttempts.filter(
@@ -5764,15 +5780,15 @@ async function checkVerifyRateLimitInner(
       ? recentAttempts.filter((a) => (a.phone ?? "") === phoneNorm).length
       : 0;
   if (
-    idAttempts >= VERIFY_MAX_PER_WINDOW ||
-    phoneAttempts >= VERIFY_MAX_PER_WINDOW ||
-    recentAttempts.length >= VERIFY_GLOBAL_MAX_PER_WINDOW
+    idAttempts >= limits.max ||
+    phoneAttempts >= limits.max ||
+    recentAttempts.length >= limits.globalMax
   ) {
     throw new Error(RATE_LIMIT_MESSAGE);
   }
   await db
     .insert(schema.verifyAttempts)
-    .values({ idCard: norm(idCardNorm), phone: phoneNorm });
+    .values({ idCard: norm(idCardNorm), phone: phoneNorm, kind });
   await db
     .delete(schema.verifyAttempts)
     .where(lt(schema.verifyAttempts.createdAt, windowStart));

@@ -431,12 +431,11 @@ const server = createServer(async (req, res) => {
         typeof body.args === "object" && body.args !== null
           ? (body.args as Record<string, unknown>)
           : {};
-      // submitPaymentScreenshot、getDebtorChat 与 verifyIdentity 共用同一核验限流窗口
-      //（同一 IP 每 10 分钟 20 次），防身份证枚举与截图接口滥用。
+      // 核验与传截图共用同一 IP 限流窗口（同一 IP 每 10 分钟 20 次），
+      // 防身份证枚举与截图接口滥用。聊天（getDebtorChat 拉取、sendDebtorMessage
+      // 发送）不限流（用户 2026-11-10 亲定：聊天不设频繁限制，只认手动禁言）。
       if (
-        (name === "verifyIdentity" ||
-          name === "submitPaymentScreenshot" ||
-          name === "getDebtorChat") &&
+        (name === "verifyIdentity" || name === "submitPaymentScreenshot") &&
         checkVerifyLimit(ip)
       ) {
         tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");
@@ -536,12 +535,11 @@ const server = createServer(async (req, res) => {
         typeof args === "object" && args !== null
           ? (args as Record<string, unknown>)
           : {};
-      // submitPaymentScreenshot、getDebtorChat 与 verifyIdentity 共用同一核验限流窗口
-      //（同一 IP 每 10 分钟 20 次），防身份证枚举与截图接口滥用。
+      // 核验与传截图共用同一 IP 限流窗口（同一 IP 每 10 分钟 20 次），
+      // 防身份证枚举与截图接口滥用。聊天（getDebtorChat 拉取、sendDebtorMessage
+      // 发送）不限流（用户 2026-11-10 亲定：聊天不设频繁限制，只认手动禁言）。
       if (
-        (name === "verifyIdentity" ||
-          name === "submitPaymentScreenshot" ||
-          name === "getDebtorChat") &&
+        (name === "verifyIdentity" || name === "submitPaymentScreenshot") &&
         checkVerifyLimit(ip)
       ) {
         tooManyRequests(req, res, "核验尝试次数过多，请10分钟后再试");

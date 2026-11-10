@@ -354,6 +354,7 @@ export const verifyAttempts = sqliteTable("verify_attempts", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   idCard: text("id_card").notNull().default(""),
   phone: text("phone").notNull().default(""),
+  kind: text("kind").notNull().default("verify"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
