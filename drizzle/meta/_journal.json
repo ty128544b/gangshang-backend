@@ -127,6 +127,13 @@
       "when": 1794278269715,
       "tag": "0018_add_corporate_account",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1794286000000,
+      "tag": "0019_add_lawyer_progress_steps",
+      "breakpoints": true
     }
   ]
 }

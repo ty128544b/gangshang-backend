@@ -240,6 +240,29 @@ const EMPTY_CORPORATE_ACCOUNT: z.infer<typeof corporateAccountOut> = {
   qrImageUrl: "",
 };
 
+/* 律师工作进度（办理进度时间轴）：state 为 done 已完成 / now 进行中 /
+   todo 待进行；dateLabel 已完成填日期（如 10-20），进行中填“进行中”，
+   待进行填“待进行”。后台未保存过时用这组默认进度：当前在入户调查这一步，
+   先入户调查、再单位调查，收入核实待进行。 */
+const lawyerProgressStepOut = z.object({
+  id: z.number(),
+  sortOrder: z.number(),
+  title: z.string(),
+  description: z.string(),
+  dateLabel: z.string(),
+  state: z.enum(["done", "now", "todo"]),
+});
+
+const DEFAULT_LAWYER_PROGRESS: z.infer<typeof lawyerProgressStepOut>[] = [
+  { id: 0, sortOrder: 0, title: "接受委托 · 债权材料核验", description: "转让协议、借款合同、还款记录已归档", dateLabel: "10-20", state: "done" },
+  { id: 0, sortOrder: 1, title: "律师函已送达", description: "已通过短信、挂号信双通道送达并留存回执", dateLabel: "10-25", state: "done" },
+  { id: 0, sortOrder: 2, title: "律师到户到村入户调查中", description: "正在前往户籍地、村（居）委会核实家庭收入来源与实际居住情况", dateLabel: "进行中", state: "now" },
+  { id: 0, sortOrder: 3, title: "律师前往工作单位调查核实", description: "向所在单位核实任职情况与收入发放方式", dateLabel: "待进行", state: "todo" },
+  { id: 0, sortOrder: 4, title: "收入核实", description: "入户与单位调查完成后核实月收入与工资代发账户", dateLabel: "待进行", state: "todo" },
+  { id: 0, sortOrder: 5, title: "向法院申请财产保全", description: "冻结银行账户、微信及支付宝资金", dateLabel: "待进行", state: "todo" },
+  { id: 0, sortOrder: 6, title: "执行扣划 · 列入失信名单", description: "按核实收入执行工资扣划，直至清偿完毕", dateLabel: "待进行", state: "todo" },
+];
+
 const EMPTY_DEMO_BILL: z.infer<typeof demoBillOut> = {
   debtorName: "",
   caseNo: "",
@@ -531,6 +554,10 @@ async function loadHomepageExtras(ctx: Ctx) {
   const psRow = ps[0];
   const ca = await db.select().from(schema.corporateAccount);
   const caRow = ca[0];
+  const lp = await db
+    .select()
+    .from(schema.lawyerProgressSteps)
+    .orderBy(asc(schema.lawyerProgressSteps.sortOrder), asc(schema.lawyerProgressSteps.id));
   const dbRows = await db.select().from(schema.demoBill);
   const dbRow = dbRows[0];
   return {
@@ -574,6 +601,17 @@ async function loadHomepageExtras(ctx: Ctx) {
           qrImageUrl: caRow.qrImageUrl,
         }
       : { ...EMPTY_CORPORATE_ACCOUNT },
+    lawyerProgress:
+      lp.length > 0
+        ? lp.map((r) => ({
+            id: r.id,
+            sortOrder: r.sortOrder,
+            title: r.title,
+            description: r.description,
+            dateLabel: r.dateLabel,
+            state: r.state as "done" | "now" | "todo",
+          }))
+        : DEFAULT_LAWYER_PROGRESS.map((s) => ({ ...s })),
     demoBill: dbRow
       ? {
           debtorName: dbRow.debtorName,
@@ -3940,7 +3978,7 @@ const baseActions = {
   /* ---------------- 首页内容：审结案件 + 律师动态 ---------------- */
 
   getHomepageContent: defineAction({
-    description: "读取债务人网页首页展示的全部内容：系统名称、近期法院审结案件、律师工作动态、保全划扣板块、今日已还款、顶部执行状态滚动条、失信惩戒、聊天付款卡设置（专员收款方式）、首页对公账号设置与账单示例（后台改动即网页同步；新板块后端无数据时返回空列表/空对象，网页按现有占位显示）。",
+    description: "读取债务人网页首页展示的全部内容：系统名称、近期法院审结案件、律师工作动态、保全划扣板块、今日已还款、顶部执行状态滚动条、失信惩戒、聊天付款卡设置（专员收款方式）、首页对公账号设置、律师工作进度（办理进度时间轴）与账单示例（后台改动即网页同步；新板块后端无数据时返回空列表/空对象，网页按现有占位显示）。",
     request: z.object({}),
     response: z.object({
       systemName: z.string(),
@@ -3956,6 +3994,7 @@ const baseActions = {
       punishmentItems: z.array(punishmentItemOut),
       paymentSettings: paymentSettingsOut,
       corporateAccount: corporateAccountOut,
+      lawyerProgress: z.array(lawyerProgressStepOut),
       demoBill: demoBillOut,
     }),
     async handler(ctx) {
@@ -4480,6 +4519,42 @@ const baseActions = {
       } else {
         await db.insert(schema.corporateAccount).values({ ...args });
       }
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  /* ---------------- 首页内容：律师工作进度（办理进度时间轴） ---------------- */
+
+  updateLawyerProgress: defineAction({
+    description:
+      "保存律师工作进度（办理进度时间轴）整组步骤：每步标题、说明、日期标注与状态（done 已完成 / now 进行中 / todo 待进行），按列表顺序保存，保存后债务人页办理进度即同步。未保存过时网页用默认进度（当前在入户调查这一步）。",
+    request: z.object({
+      steps: z
+        .array(
+          z.object({
+            title: z.string().trim().min(1, "步骤标题不能为空").max(60),
+            description: z.string().max(200).default(""),
+            dateLabel: z.string().max(20).default(""),
+            state: z.enum(["done", "now", "todo"]),
+          }),
+        )
+        .min(1, "至少保留一个步骤")
+        .max(20),
+    }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.lawyerProgressSteps);
+      await db.insert(schema.lawyerProgressSteps).values(
+        args.steps.map((s, i) => ({
+          sortOrder: i,
+          title: s.title,
+          description: s.description,
+          dateLabel: s.dateLabel,
+          state: s.state,
+        })),
+      );
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5535,7 +5610,7 @@ const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 
 // 网页首页内容编辑（内容权限）：审结案件、律师动态、保全划扣、今日
-// 已还款、滚动条、失信惩戒、付款卡、对公账号、账单示例与系统名称。
+// 已还款、滚动条、失信惩戒、付款卡、对公账号、律师工作进度、账单示例与系统名称。
 const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "addCourtCase",
   "updateCourtCase",
@@ -5559,6 +5634,7 @@ const PAGE_EDIT_ACTIONS: ReadonlySet<string> = new Set([
   "deletePunishmentItem",
   "updatePaymentSettings",
   "updateCorporateAccount",
+  "updateLawyerProgress",
   "updateDemoBill",
   "updateSystemName",
 ]);

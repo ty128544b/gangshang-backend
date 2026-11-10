@@ -253,6 +253,18 @@ export const corporateAccount = sqliteTable("corporate_account", {
   qrImageUrl: text("qr_image_url").notNull().default(""),
 });
 
+/* ---------------- 律师工作进度（办理进度时间轴，后台可改） ----------------
+   state：done 已完成 / now 进行中 / todo 待进行。dateLabel：已完成填日期
+   （如 10-20），进行中填“进行中”，待进行填“待进行”。顺序按 sortOrder。 */
+export const lawyerProgressSteps = sqliteTable("lawyer_progress_steps", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  sortOrder: integer("sort_order").notNull().default(0),
+  title: text("title").notNull().default(""),
+  description: text("description").notNull().default(""),
+  dateLabel: text("date_label").notNull().default(""),
+  state: text("state").notNull().default("todo"),
+});
+
 /* ---------------- 短信链接点击记录 ---------------- */
 
 // 债务人点开短信链接时由债务人网页调用 recordLinkClick 记一条；
