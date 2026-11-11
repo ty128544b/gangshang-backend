@@ -502,3 +502,16 @@ export const deletedItems = sqliteTable("deleted_items", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// 系统快照：一键还原用的整库备份点。快照文件存 blobs（system-snapshots/），
+// 这里只记元数据。还原时先自动备份当前库，再用快照替换，重启后生效。
+export const systemSnapshots = sqliteTable("system_snapshots", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  blobKey: text("blob_key").notNull(),
+  label: text("label").notNull().default(""),
+  caseCount: integer("case_count").notNull().default(0),
+  sizeBytes: integer("size_bytes").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});

@@ -6,6 +6,8 @@ import {
   type Ctx,
   type SpaceDb,
 } from "./shim";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { and, asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
@@ -678,6 +680,58 @@ async function archiveData(
       })
       .returning({ id: schema.deletedItems.id });
     return inserted[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- 系统快照（一键还原） ----------
+// 把当前整库快照成一个备份点，存 blobs（system-snapshots/），只留最近 10 个。
+async function createSnapshotRow(
+  ctx: Ctx,
+  label: string,
+): Promise<{ id: number; blobKey: string } | null> {
+  const db = ctx.db<typeof schema>();
+  try {
+    // 先把 WAL 刷回主文件，保证快照自包含。
+    try {
+      await (db as unknown as { run: (q: string) => Promise<unknown> }).run("PRAGMA wal_checkpoint(TRUNCATE);");
+    } catch {
+      /* checkpoint 失败也继续，用当前主文件快照 */
+    }
+    const dataDir = (ctx as unknown as { spaceDir?: string }).spaceDir ?? "";
+    const dbFile = join(dataDir, "gangshang.db");
+    const buf = readFileSync(dbFile);
+    if (buf.length < 100 || buf.subarray(0, 6).toString() !== "SQLite") return null;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const blobKey = `system-snapshots/${stamp}.db`;
+    await ctx.blobs.put(blobKey, buf, { contentType: "application/octet-stream" });
+    const caseRows = await db.select({ id: schema.cases.id }).from(schema.cases);
+    const inserted = await db
+      .insert(schema.systemSnapshots)
+      .values({
+        blobKey,
+        label: label.slice(0, 200),
+        caseCount: caseRows.length,
+        sizeBytes: buf.length,
+      })
+      .returning({ id: schema.systemSnapshots.id });
+    const id = inserted[0]?.id ?? null;
+    if (id == null) return null;
+    // 只留最近 10 个，删掉更早的快照文件与记录。
+    const all = await db
+      .select()
+      .from(schema.systemSnapshots)
+      .orderBy(desc(schema.systemSnapshots.id));
+    for (const old of all.slice(10)) {
+      try {
+        await ctx.blobs.delete(old.blobKey);
+      } catch {
+        /* 删文件失败不拦 */
+      }
+      await db.delete(schema.systemSnapshots).where(eq(schema.systemSnapshots.id, old.id));
+    }
+    return { id, blobKey };
   } catch {
     return null;
   }
@@ -3721,6 +3775,94 @@ const baseActions = {
           createdAt: (r.createdAt as Date).toISOString(),
         })),
       };
+    },
+  }),
+
+  // 系统快照：一键还原用的整库备份点。仅管理员可用。
+  createSystemSnapshot: defineAction({
+    description: "立即给当前整个系统（案件、聊天、还款、页面内容、话术、已学话术）拍一个快照备份点。仅管理员可用。",
+    request: z.object({ label: z.string().max(200).optional() }),
+    response: z.object({ ok: z.boolean(), id: z.number().nullable() }),
+    async handler(ctx, args) {
+      const session = currentSession(ctx);
+      if (!session || session.role !== "admin") {
+        throw new Error("HTTP403:仅管理员可以备份系统");
+      }
+      const snap = await createSnapshotRow(ctx, args.label?.trim() || "手动备份");
+      if (!snap) throw new Error("HTTP500:备份失败");
+      await logAudit(ctx, "create_snapshot", "system", snap.id, `创建系统快照 ${snap.id}`);
+      return { ok: true, id: snap.id };
+    },
+  }),
+
+  listSystemSnapshots: defineAction({
+    description: "列出系统快照备份点，最新在前。仅管理员可用。",
+    request: z.object({}),
+    response: z.object({
+      snapshots: z.array(
+        z.object({
+          id: z.number(),
+          label: z.string(),
+          caseCount: z.number(),
+          sizeBytes: z.number(),
+          createdAt: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx) {
+      const session = currentSession(ctx);
+      if (!session || session.role !== "admin") {
+        throw new Error("HTTP403:仅管理员可以查看系统快照");
+      }
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.systemSnapshots)
+        .orderBy(desc(schema.systemSnapshots.id))
+        .limit(20);
+      return {
+        snapshots: rows.map((r) => ({
+          id: r.id,
+          label: r.label,
+          caseCount: r.caseCount,
+          sizeBytes: r.sizeBytes,
+          createdAt: (r.createdAt as Date).toISOString(),
+        })),
+      };
+    },
+  }),
+
+  restoreSystemSnapshot: defineAction({
+    description: "一键还原：把整个系统（案件、聊天、还款、页面内容、话术、已学话术）还原到指定快照。还原前先自动备份当前系统，还原后服务重启生效。仅管理员可用。",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const session = currentSession(ctx);
+      if (!session || session.role !== "admin") {
+        throw new Error("HTTP403:仅管理员可以还原系统");
+      }
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.systemSnapshots)
+        .where(eq(schema.systemSnapshots.id, args.id))
+        .limit(1);
+      if (rows.length === 0) throw new Error("HTTP404:没有这个快照");
+      const snap = rows[0];
+      // 还原前先自动备份当前系统，还原本身也可反悔。
+      await createSnapshotRow(ctx, "还原前自动备份");
+      const dataDir = (ctx as unknown as { spaceDir?: string }).spaceDir ?? "";
+      // 快照文件存在 blobs 目录下（system-snapshots/…），直接读文件。
+      const snapFile = join(dataDir, "blobs", snap.blobKey);
+      const buf = readFileSync(snapFile);
+      if (buf.length < 100 || buf.subarray(0, 6).toString() !== "SQLite") {
+        throw new Error("HTTP500:快照文件损坏，无法还原");
+      }
+      writeFileSync(join(dataDir, "gangshang.db.restored"), buf);
+      await logAudit(ctx, "restore_system", "system", snap.id, `一键还原到快照 ${snap.id}（${snap.label}）`);
+      // 写盘后退出，启动时自动用还原文件替换当前库。
+      setTimeout(() => process.exit(0), 500);
+      return { ok: true };
     },
   }),
 
@@ -6869,6 +7011,9 @@ const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
   "listDeletedItems",
   "restoreDeletedItem",
   "listAuditLogs",
+  "createSystemSnapshot",
+  "listSystemSnapshots",
+  "restoreSystemSnapshot",
   "addStep",
   "updateStep",
   "deleteStep",
