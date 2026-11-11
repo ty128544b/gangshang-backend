@@ -365,29 +365,7 @@ const GENERATE_REPLY_SYSTEM_TEMPLATE = `你是港上资产执行系统的催收�
 11. 对方说“人工”“转人工”“找真人”“换个人”“让你们领导来”，只回“好的，已为您转接专员，请稍等”，不要再推付款。
 12. 先接对方这句话（他说什么你先回什么），再提付款。不要上来就推付款。
 
-标准示范（照这个格式回）：
-债务人：“我没钱”
-你：“今天先付 {lockAmount} 锁定，还是按 {amount} 结清？今天过期，恢复 {amount}。”
-债务人：“我上个月就还了 ¥5,000”
-你：“先把付款截图发我核对，确认到账再算。截图今天发来，过期恢复 {amount}。”
-债务人：“我每个月还 ¥100”
-你：“100 太少，6 期 {install6}，还是 12 期 {install12}？今天前定，过期恢复 {amount}。”
-债务人：“都过去 6 年了，诉讼时效早过了，你们告不了我”
-你：“时效过了债还在，书面确认能断时效。今天回确认二字，还是等法院传票？”
-债务人：“我根本不认识这个人，这笔钱不是我的”
-你：“先核对身份，身份证号报我核对。核对不上不催你，核对上今天结清？”
-债务人：“我刚查出癌症，化疗要花几十万，我还不起”
-你：“先付 {lockAmount} 锁定分期，还是 12 期每月 {install12}？今天前定，过期恢复 {amount}。”
-债务人：“我是律师，你这套话术对我没用”
-你：“法律问题法院见，先付 {lockAmount} 锁定？今天过期，恢复 {amount}。”
-债务人：“你们再催我就报警，说你们骚扰我”
-你：“报警是你的权利，先付 {lockAmount} 锁定？今天过期，恢复 {amount}。”
-债务人：“人工”
-你：“好的，已为您转接专员，请稍等。”
-债务人：“没钱”（上一句你已经给过锁定还是结清的选择）
-你：“6 期每月 {install6}，还是 12 期每月 {install12}？今天前定，过期恢复 {amount}。”
-债务人：“就不还，你能怎么样？”
-你：“不还走法律程序，失信名单全国联网。今天锁定，还是等传票？”`;
+【标准示范由后台话术设置（chat_scripts 表）提供，见下文“后台话术”一节，与关键词规则同一套，不另写。】`;
 
 // 金额格式化：与债务人页 fillTpl 的 yuanStr 同口径（分转元，整数不带
 // 小数位，有小数最多 2 位，千分位逗号）。
@@ -405,6 +383,7 @@ function yuanForPrompt(cents: number): string {
 function buildGenerateReplySystem(
   row: typeof schema.cases.$inferSelect,
   learned: string[] = [],
+  scripts?: ChatScriptsData | null,
 ): string {
   const totalYuan = (Number(row.totalDueCents) || 0) / 100;
   const interestCents = Math.max(
@@ -425,20 +404,52 @@ function buildGenerateReplySystem(
       100,
       Math.round(totalYuan * 0.1),
     ).toLocaleString("zh-CN"),
+    "{caseNo}": row.caseNo ?? "",
+    "{agreementNo}": row.transferAgreementNo ?? "",
+    "{debtorName}": row.debtorName ?? "",
+    "{creditor}": row.originalCreditor ?? "",
   };
-  const base = GENERATE_REPLY_SYSTEM_TEMPLATE.replace(
+  const fill = (t: string) =>
+    t.replace(
+      /\{[a-zA-Z0-9]+\}/g,
+      (k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k),
+    );
+  let base = GENERATE_REPLY_SYSTEM_TEMPLATE.replace(
     /\{[a-zA-Z0-9]+\}/g,
     (k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k),
   );
+  // 后台话术（与关键词规则同一套 chat_scripts 表，管理员在后台改完，
+  // AI 下次生成即用同一套，不再各说各的）：规则按 pattern→reply 当示范，
+  // 开场白与兜底也一并给模型参考。
+  if (scripts) {
+    const ruleLines = (scripts.rules ?? [])
+      .filter((r) => (r.reply ?? "").trim().length > 0)
+      .map(
+        (r) =>
+          `债务人说到“${r.pattern}”时回：“${fill(r.reply)}”`,
+      );
+    const sections: string[] = [];
+    if (ruleLines.length > 0) {
+      sections.push(
+        `【后台话术（与关键词规则同一套，照这个回）】\n${ruleLines.join("\n")}`,
+      );
+    }
+    const opening = (scripts.opening ?? [])
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (opening.length > 0) {
+      sections.push(`【开场白参考】\n${opening.map((s) => fill(s)).join("\n")}`);
+    }
+    const fallback = (scripts.fallback?.reply ?? "").trim();
+    if (fallback) {
+      sections.push(`【兜底回复】${fill(fallback)}`);
+    }
+    if (sections.length > 0) base += `\n\n${sections.join("\n\n")}`;
+  }
   // 已学成功话术（整条入库、去重后的）：当示范追加，数字按本案填。
   if (learned.length === 0) return base;
   const examples = learned
-    .map((t) =>
-      t.replace(
-        /\{[a-zA-Z0-9]+\}/g,
-        (k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k),
-      ),
-    )
+    .map((t) => fill(t))
     .map((t) => `— ${t}`)
     .join("\n");
   return `${base}\n\n【已验证有效的催收话术（真实催回过款，照着这个风格回）】\n${examples}`;
@@ -3977,8 +3988,15 @@ const baseActions = {
       const apiKey = await loadModelApiKey(ctx);
       // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
       // 已学成功话术一并拼进提示词当示范。
+      // 后台话术与关键词规则同一套 chat_scripts 表：后台改完，AI 即用同一套。
       const learned = await loadLearnedScripts(ctx);
-      const system = buildGenerateReplySystem(row, learned);
+      let scripts: ChatScriptsData | null = null;
+      try {
+        scripts = await loadChatScripts(ctx);
+      } catch {
+        scripts = null;
+      }
+      const system = buildGenerateReplySystem(row, learned, scripts);
       const history = (args.history ?? []).slice(-6).map((m) => ({
         role: m.role,
         content: m.content,
