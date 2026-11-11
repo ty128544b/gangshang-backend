@@ -446,13 +446,14 @@ function buildGenerateReplySystem(
     }
     if (sections.length > 0) base += `\n\n${sections.join("\n\n")}`;
   }
-  // 已学成功话术（整条入库、去重后的）：当示范追加，数字按本案填。
+  // 已学成功话术（专员平时说话 + 真实催回过款的，整条入库、去重后）：
+  // 当示范追加，数字按本案填。这是 AI 口气的标准，优先照着这个风格回。
   if (learned.length === 0) return base;
   const examples = learned
     .map((t) => fill(t))
     .map((t) => `— ${t}`)
     .join("\n");
-  return `${base}\n\n【已验证有效的催收话术（真实催回过款，照着这个风格回）】\n${examples}`;
+  return `${base}\n\n【专员说话方式（专员平时真人发的 + 真实催回过款的，照着这个口气回）】\n${examples}`;
 }
 
 /* ---------------- 已学成功话术库 ----------------
@@ -468,6 +469,52 @@ function normalizeScript(text: string): string {
 
 function deNumberScript(text: string): string {
   return text.replace(/[0-9][0-9,，.、]*/g, "{N}");
+}
+
+// 专员发消息时立即学：专员平时说话的口气就是 AI 要学的标准，不用等
+// 收款。归一化去重（同 promoteLearnedScripts 口径），失败不影响发消息。
+async function learnAgentMessage(
+  ctx: Ctx,
+  caseId: number,
+  text: string,
+): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const normalized = normalizeScript(text);
+  if (!normalized || normalized.length < 4) return;
+  try {
+    const exists = await db
+      .select({ id: schema.learnedScripts.id })
+      .from(schema.learnedScripts)
+      .where(eq(schema.learnedScripts.normalized, normalized))
+      .limit(1);
+    if (exists.length > 0) return;
+    // 触发语境：该案债务人最近一条消息，供以后按场景参考。
+    let trigger = "";
+    try {
+      const last = await db
+        .select({ text: schema.chatMessages.text })
+        .from(schema.chatMessages)
+        .where(
+          and(
+            eq(schema.chatMessages.caseId, caseId),
+            eq(schema.chatMessages.sender, "debtor"),
+          ),
+        )
+        .orderBy(desc(schema.chatMessages.id))
+        .limit(1);
+      trigger = last[0]?.text ?? "";
+    } catch {
+      trigger = "";
+    }
+    await db.insert(schema.learnedScripts).values({
+      text: deNumberScript(text),
+      normalized,
+      trigger,
+      sourceCaseId: caseId,
+    });
+  } catch {
+    // 学习失败不影响发消息本身。
+  }
 }
 
 // 取已学话术（最新 N 条）拼进提示词当示范；用时 useCount+1。
@@ -3669,6 +3716,10 @@ const baseActions = {
             .update(schema.cases)
             .set({ humanTakeoverAt: new Date(), updatedAt: new Date() })
             .where(eq(schema.cases.id, args.caseId));
+        }
+        // 专员发消息即学口气：AI 以后照着专员平时说话的方式回。
+        if ((args.text ?? "").trim().length > 0) {
+          await learnAgentMessage(ctx, args.caseId, args.text);
         }
       }
       ctx.invalidateQueries();
