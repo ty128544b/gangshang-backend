@@ -294,11 +294,17 @@ async function loadSystemName(ctx: Ctx): Promise<string> {
    0023），空串 = 未配，走下面代码默认值。轮换监控负责在端点变化时
    更新这一列，改地址不需要改代码。 */
 
-// 模型端点默认值（当前长期线 serveo，无 60 分钟上限，跟着 Colab 会话
-// 活，最长 12 小时）。这只是初始值/兜底：库里配了就以库里为准。
-// 不要用 pinggy（免费档 60 分钟过期）或 localhost.run（已证实不稳定）。
-const DEFAULT_MODEL_ENDPOINT_URL =
-  "https://c757069102089b96-136-67-225-218.serveousercontent.com";
+// 模型端点默认值：Groq 托管 API（qwen/qwen3.8-27b，免费层）。
+// 2026-11-11 用户在手机上注册 Groq 成功（ty629526@gmail.com），
+// key 已验证可用，3 道催收题全过。Groq 不支持自传模型，14B 只能
+// 跑自有 GPU，不走这条线。API key 不进代码/仓库，从环境变量
+// GROQ_API_KEY 读（FadeHost 面板 /api/bots/{id}/env 设置）。
+// 库里配了端点就以库里为准；旧 serveo/pinggy 死链由管理动作改掉。
+const DEFAULT_MODEL_ENDPOINT_URL = "https://api.groq.com/openai/v1";
+
+// Groq API key：只从环境变量读，绝不写进代码（仓库是公开的）。
+// 未配时 generateReply 返回 modelAvailable:false，债务人页回落关键词。
+const GROQ_API_KEY = (process.env.GROQ_API_KEY ?? "").trim();
 
 async function loadModelEndpointUrl(ctx: Ctx): Promise<string> {
   const db = ctx.db<typeof schema>();
@@ -3809,7 +3815,7 @@ const baseActions = {
 
   generateReply: defineAction({
     description:
-      "债务人端机器人用真模型生成回复（公开接口，无需登录令牌，债务人页在身份核验通过后调用）：校验案件存在、身份证号归一化一致；禁言案件直接拒绝；人工接管时不调模型、返回 modelAvailable:false。按案件数据拼 SYSTEM 提示词（回复铁律生产版，占位符按本案数值填），调 modelEndpointUrl 的 /v1/chat/completions（qwen2.5-14b，temperature=0，max_tokens=100，30 秒超时）。模型不可用（未配端点/超时/非 2xx/解析失败）时返回 modelAvailable:false、reply:null，不抛错，债务人页回落到关键词规则。机器人回复不写库。",
+      "债务人端机器人用真模型生成回复（公开接口，无需登录令牌，债务人页在身份核验通过后调用）：校验案件存在、身份证号归一化一致；禁言案件直接拒绝；人工接管时不调模型、返回 modelAvailable:false。按案件数据拼 SYSTEM 提示词（回复铁律生产版，占位符按本案数值填），调 modelEndpointUrl 的 /v1/chat/completions（Groq qwen/qwen3.8-27b，temperature=0，max_tokens=100，30 秒超时；API key 从环境变量 GROQ_API_KEY 读）。模型不可用（未配端点/超时/非 2xx/解析失败）时返回 modelAvailable:false、reply:null，不抛错，债务人页回落到关键词规则。机器人回复不写库。",
     request: z.object({
       caseId: z.number().int().positive(),
       idCard: z.string().trim().min(18, "身份证号必须为18位").max(18, "身份证号必须为18位"),
@@ -3879,7 +3885,7 @@ const baseActions = {
       // 每次新建连接可避开这个问题（与 curl 每次新建连接同理）。
       const url = `${endpoint.replace(/\/+$/, "")}/v1/chat/completions`;
       const body = JSON.stringify({
-        model: "qwen2.5-14b",
+        model: "qwen/qwen3.8-27b",
         messages,
         temperature: 0,
         max_tokens: 100,
@@ -3891,6 +3897,9 @@ const baseActions = {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
+              ...(GROQ_API_KEY
+                ? { Authorization: `Bearer ${GROQ_API_KEY}` }
+                : {}),
               Connection: "close",
             },
             body,
@@ -5184,6 +5193,39 @@ const baseActions = {
       }
       ctx.invalidateQueries();
       return { ok: true, systemName: args.systemName };
+    },
+  }),
+
+  updateModelEndpointUrl: defineAction({
+    description:
+      "修改真模型端点地址（generateReply 调用的模型服务地址）：轮换监控在隧道重起、端点地址变化时调它更新 system_settings 单例行的 model_endpoint_url，之后 generateReply 即按新地址调模型，不用改代码。管理员与用户账号都可用（属于网页首页内容编辑）。地址须为 https 开头的合法 URL，最长 500 字；传空串表示清空（generateReply 未配端点时返回 modelAvailable:false，债务人页回落到关键词规则）。",
+    request: z.object({
+      modelEndpointUrl: z
+        .string()
+        .trim()
+        .max(500, "端点地址最长 500 字")
+        .refine(
+          (v) => v === "" || /^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/.*)?$/.test(v),
+          "端点地址须为 https 开头的合法 URL，传空串表示清空",
+        ),
+    }),
+    response: z.object({ ok: z.boolean(), modelEndpointUrl: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.systemSettings);
+      const row = rows[0];
+      if (row) {
+        await db
+          .update(schema.systemSettings)
+          .set({ modelEndpointUrl: args.modelEndpointUrl })
+          .where(eq(schema.systemSettings.id, row.id));
+      } else {
+        await db
+          .insert(schema.systemSettings)
+          .values({ modelEndpointUrl: args.modelEndpointUrl });
+      }
+      ctx.invalidateQueries();
+      return { ok: true, modelEndpointUrl: args.modelEndpointUrl };
     },
   }),
 
