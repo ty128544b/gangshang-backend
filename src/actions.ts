@@ -656,7 +656,33 @@ async function archiveCase(
   }
 }
 
-// 把一条还款记录快照进回收站。
+// 把一条已取到的行快照进回收站（页面信息、步骤、聊天、协议、技巧等通用）。
+// 各删除口子先取行、调这个归档、再删；恢复时按 kind 把 row 原样插回对应表。
+async function archiveData(
+  ctx: Ctx,
+  kind: string,
+  id: number,
+  label: string,
+  row: unknown,
+): Promise<number | null> {
+  const db = ctx.db<typeof schema>();
+  try {
+    const inserted = await db
+      .insert(schema.deletedItems)
+      .values({
+        kind,
+        itemId: id,
+        label: label.slice(0, 200),
+        data: JSON.stringify({ row }),
+        deletedBy: auditActor(ctx),
+      })
+      .returning({ id: schema.deletedItems.id });
+    return inserted[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function archivePayment(
   ctx: Ctx,
   paymentId: number,
@@ -3634,7 +3660,24 @@ const baseActions = {
         const { id: _id, ...rest } = s.payment;
         await db.insert(schema.payments).values({ ...(rest as Record<string, unknown>), id: s.payment.id as number } as never);
       } else {
-        throw new Error("HTTP400:这种类型不支持恢复");
+        // 通用单行恢复（页面信息、步骤、聊天、协议、技巧等）：按 kind 找表插回。
+        const singleTables: Record<string, unknown> = {
+          court_case: schema.courtCases,
+          lawyer_update: schema.lawyerUpdates,
+          feed_item: schema.preservationFeedItems,
+          today_repayment: schema.todayRepayments,
+          ticker_item: schema.tickerItems,
+          punishment_item: schema.punishmentItems,
+          step: schema.progressSteps,
+          chat_message: schema.chatMessages,
+          agreement: schema.agreements,
+          technique: schema.techniques,
+        };
+        const table = singleTables[item.kind];
+        if (!table) throw new Error("HTTP400:这种类型不支持恢复");
+        const s = snapshot as { row: Record<string, unknown> };
+        const { id: _id, ...rest } = s.row;
+        await db.insert(table as never).values({ ...(rest as Record<string, unknown>), id: s.row.id as number } as never);
       }
       await db.delete(schema.deletedItems).where(eq(schema.deletedItems.id, args.id));
       await logAudit(ctx, "restore_deleted", item.kind, item.itemId, `从回收站恢复 ${item.kind} ${item.label}`);
@@ -3809,9 +3852,11 @@ const baseActions = {
         .where(eq(schema.progressSteps.id, args.id))
         .limit(1);
       if (stepRows[0]) await assertCaseVisible(ctx, stepRows[0].caseId);
+      const archiveId = stepRows[0] ? await archiveData(ctx, "step", args.id, String((stepRows[0] as Record<string, unknown>).title ?? (stepRows[0] as Record<string, unknown>).content ?? ""), stepRows[0]) : null;
       await db
         .delete(schema.progressSteps)
         .where(eq(schema.progressSteps.id, args.id));
+      await logAudit(ctx, "delete_step", "step", args.id, `删除进度步骤 ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4488,9 +4533,11 @@ const baseActions = {
         .limit(1);
       const row = rows[0];
       if (row) await assertCaseVisible(ctx, row.caseId);
+      const archiveId = row ? await archiveData(ctx, "chat_message", args.id, String((row as Record<string, unknown>).text ?? ""), row) : null;
       await db
         .delete(schema.chatMessages)
         .where(eq(schema.chatMessages.id, args.id));
+      await logAudit(ctx, "delete_chat_message", "chat_message", args.id, `删除聊天消息 ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       if (row?.imageBlobKey) {
         try {
           await ctx.blobs.delete(row.imageBlobKey);
@@ -4590,9 +4637,11 @@ const baseActions = {
         .where(eq(schema.agreements.id, args.id))
         .limit(1);
       if (agRows[0]) await assertCaseVisible(ctx, agRows[0].caseId);
+      const archiveId = agRows[0] ? await archiveData(ctx, "agreement", args.id, String((agRows[0] as Record<string, unknown>).title ?? (agRows[0] as Record<string, unknown>).content ?? ""), agRows[0]) : null;
       await db
         .delete(schema.agreements)
         .where(eq(schema.agreements.id, args.id));
+      await logAudit(ctx, "delete_agreement", "agreement", args.id, `删除协商事项 ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -4955,9 +5004,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.courtCases)
-        .where(eq(schema.courtCases.id, args.id));
+      const rows = await db.select().from(schema.courtCases).where(eq(schema.courtCases.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "court_case", args.id, String(row?.caseNo ?? row?.title ?? ''), row) : null;
+      await db.delete(schema.courtCases).where(eq(schema.courtCases.id, args.id));
+      await logAudit(ctx, "delete_court_case", "court_case", args.id, `删除 court_case ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5013,9 +5064,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.lawyerUpdates)
-        .where(eq(schema.lawyerUpdates.id, args.id));
+      const rows = await db.select().from(schema.lawyerUpdates).where(eq(schema.lawyerUpdates.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "lawyer_update", args.id, String(row?.title ?? row?.content ?? ''), row) : null;
+      await db.delete(schema.lawyerUpdates).where(eq(schema.lawyerUpdates.id, args.id));
+      await logAudit(ctx, "delete_lawyer_update", "lawyer_update", args.id, `删除 lawyer_update ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5141,9 +5194,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.preservationFeedItems)
-        .where(eq(schema.preservationFeedItems.id, args.id));
+      const rows = await db.select().from(schema.preservationFeedItems).where(eq(schema.preservationFeedItems.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "feed_item", args.id, String(row?.title ?? row?.content ?? ''), row) : null;
+      await db.delete(schema.preservationFeedItems).where(eq(schema.preservationFeedItems.id, args.id));
+      await logAudit(ctx, "delete_feed_item", "feed_item", args.id, `删除 feed_item ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5205,9 +5260,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.todayRepayments)
-        .where(eq(schema.todayRepayments.id, args.id));
+      const rows = await db.select().from(schema.todayRepayments).where(eq(schema.todayRepayments.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "today_repayment", args.id, String(row?.debtorName ?? row?.name ?? ''), row) : null;
+      await db.delete(schema.todayRepayments).where(eq(schema.todayRepayments.id, args.id));
+      await logAudit(ctx, "delete_today_repayment", "today_repayment", args.id, `删除 today_repayment ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5261,9 +5318,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.tickerItems)
-        .where(eq(schema.tickerItems.id, args.id));
+      const rows = await db.select().from(schema.tickerItems).where(eq(schema.tickerItems.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "ticker_item", args.id, String(row?.text ?? row?.content ?? ''), row) : null;
+      await db.delete(schema.tickerItems).where(eq(schema.tickerItems.id, args.id));
+      await logAudit(ctx, "delete_ticker_item", "ticker_item", args.id, `删除 ticker_item ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -5319,9 +5378,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.punishmentItems)
-        .where(eq(schema.punishmentItems.id, args.id));
+      const rows = await db.select().from(schema.punishmentItems).where(eq(schema.punishmentItems.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "punishment_item", args.id, String(row?.title ?? row?.content ?? ''), row) : null;
+      await db.delete(schema.punishmentItems).where(eq(schema.punishmentItems.id, args.id));
+      await logAudit(ctx, "delete_punishment_item", "punishment_item", args.id, `删除 punishment_item ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -6049,9 +6110,11 @@ const baseActions = {
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      await db
-        .delete(schema.techniques)
-        .where(eq(schema.techniques.id, args.id));
+      const rows = await db.select().from(schema.techniques).where(eq(schema.techniques.id, args.id)).limit(1);
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const archiveId = row ? await archiveData(ctx, "technique", args.id, String(row?.technique ?? ''), row) : null;
+      await db.delete(schema.techniques).where(eq(schema.techniques.id, args.id));
+      await logAudit(ctx, "delete_technique", "technique", args.id, `删除 technique ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
