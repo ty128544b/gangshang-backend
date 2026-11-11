@@ -322,6 +322,17 @@ async function loadModelEndpointUrl(ctx: Ctx): Promise<string> {
   return DEFAULT_MODEL_ENDPOINT_URL;
 }
 
+// 模型 API key：优先读库里 system_settings.model_api_key，
+// 库里空串时读环境变量 GROQ_API_KEY，两者都没有返回空串。
+async function loadModelApiKey(ctx: Ctx): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.systemSettings);
+  const row = rows[0];
+  const dbKey = (row?.modelApiKey ?? "").trim();
+  if (dbKey) return dbKey;
+  return GROQ_API_KEY;
+}
+
 /* ---------------- 真模型聊天：SYSTEM 模板（回复铁律生产版） ----------------
    底本是用户自己的“回复铁律”（9 条铁律 + 8 组示范，Kaggle/Colab 笔记
    本里 8/8 通过的那版）。生产版只按用户决定改了五处，不许再私自加
@@ -3865,6 +3876,8 @@ const baseActions = {
       if (!endpoint) {
         return { reply: null, modelAvailable: false };
       }
+      // API key：库里 model_api_key 优先，没有读环境变量 GROQ_API_KEY。
+      const apiKey = await loadModelApiKey(ctx);
       // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
       const system = buildGenerateReplySystem(row);
       const history = (args.history ?? []).slice(-6).map((m) => ({
@@ -3897,9 +3910,7 @@ const baseActions = {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              ...(GROQ_API_KEY
-                ? { Authorization: `Bearer ${GROQ_API_KEY}` }
-                : {}),
+              ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
               Connection: "close",
             },
             body,

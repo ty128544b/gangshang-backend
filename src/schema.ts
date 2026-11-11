@@ -375,6 +375,11 @@ export const systemSettings = sqliteTable("system_settings", {
   // 空串 = 未配，走代码默认值（当前长期线 serveo）。轮换监控负责在
   // 端点变化时更新这一列；后端只读这一列，不再写死地址。
   modelEndpointUrl: text("model_endpoint_url").notNull().default(""),
+  // 模型 API key（Groq 等托管 API 的 Bearer 令牌）：generateReply 调
+  // 模型时当 Authorization 头带上。空串 = 未配，优先读环境变量
+  // GROQ_API_KEY，两者都没有时调模型会 401，generateReply 返回
+  // modelAvailable:false。key 不进代码/仓库，只放库里或环境变量。
+  modelApiKey: text("model_api_key").notNull().default(""),
 });
 
 /* ---------------- 聊天话术（债务人页协商机器人脚本） ---------------- */
