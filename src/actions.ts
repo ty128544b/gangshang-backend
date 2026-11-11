@@ -300,7 +300,7 @@ async function loadSystemName(ctx: Ctx): Promise<string> {
 // 跑自有 GPU，不走这条线。API key 不进代码/仓库，从环境变量
 // GROQ_API_KEY 读（FadeHost 面板 /api/bots/{id}/env 设置）。
 // 库里配了端点就以库里为准；旧 serveo/pinggy 死链由管理动作改掉。
-const DEFAULT_MODEL_ENDPOINT_URL = "https://api.groq.com/openai/v1";
+const DEFAULT_MODEL_ENDPOINT_URL = "https://api.groq.com/openai";
 
 // Groq API key：只从环境变量读，绝不写进代码（仓库是公开的）。
 // 未配时 generateReply 返回 modelAvailable:false，债务人页回落关键词。
