@@ -443,3 +443,34 @@ export const techniques = sqliteTable("techniques", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+/* ---------------- 模型回复日志 / 已学成功话术库 ----------------
+ * 模型回复不写 chat_messages（债务人页聊天只存债务人/人工消息），
+ * 但要学成功话术就得留底：generateReply 每次出回复先记 model_replies；
+ * 案件一确认收款（addPayment / setPaymentReconcile matched），就把该案
+ * 近期模型回复提进 learned_scripts。入库前归一化（数字→{N}、空白折叠）
+ * 去重：normalized 相同的只留一条，整条话术原样存 text。 */
+// 模型每次回复的流水（候选池，付款后才提进话术库）
+export const modelReplies = sqliteTable("model_replies", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  caseId: integer("case_id").notNull(),
+  trigger: text("trigger").notNull().default(""),
+  reply: text("reply").notNull().default(""),
+  promoted: integer("promoted", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// 已学成功话术库：整条存，normalized 是去重键
+export const learnedScripts = sqliteTable("learned_scripts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  text: text("text").notNull(),
+  normalized: text("normalized").notNull(),
+  trigger: text("trigger").notNull().default(""),
+  sourceCaseId: integer("source_case_id").notNull(),
+  useCount: integer("use_count").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});

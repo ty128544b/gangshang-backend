@@ -395,6 +395,7 @@ function yuanForPrompt(cents: number): string {
 // 总额 ÷6/÷12 取整；{lockAmount} = 总额约一成取整（最低 100）。
 function buildGenerateReplySystem(
   row: typeof schema.cases.$inferSelect,
+  learned: string[] = [],
 ): string {
   const totalYuan = (Number(row.totalDueCents) || 0) / 100;
   const interestCents = Math.max(
@@ -416,10 +417,97 @@ function buildGenerateReplySystem(
       Math.round(totalYuan * 0.1),
     ).toLocaleString("zh-CN"),
   };
-  return GENERATE_REPLY_SYSTEM_TEMPLATE.replace(
+  const base = GENERATE_REPLY_SYSTEM_TEMPLATE.replace(
     /\{[a-zA-Z0-9]+\}/g,
     (k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k),
   );
+  // 已学成功话术（整条入库、去重后的）：当示范追加，数字按本案填。
+  if (learned.length === 0) return base;
+  const examples = learned
+    .map((t) =>
+      t.replace(
+        /\{[a-zA-Z0-9]+\}/g,
+        (k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k),
+      ),
+    )
+    .map((t) => `— ${t}`)
+    .join("\n");
+  return `${base}\n\n【已验证有效的催收话术（真实催回过款，照着这个风格回）】\n${examples}`;
+}
+
+/* ---------------- 已学成功话术库 ----------------
+ * 归一化（去重键）：所有数字→{N}、空白折叠、去首尾。只差金额的两条
+ * 回复视为同一条话术，不重复入库。入库时把数字还原成占位符存 text，
+ * 生成时按本案数值填（与 buildGenerateReplySystem 同一套占位符）。 */
+function normalizeScript(text: string): string {
+  return text
+    .replace(/[0-9][0-9,，.、]*/g, "{N}")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function deNumberScript(text: string): string {
+  return text.replace(/[0-9][0-9,，.、]*/g, "{N}");
+}
+
+// 取已学话术（最新 N 条）拼进提示词当示范；用时 useCount+1。
+async function loadLearnedScripts(
+  ctx: Ctx,
+  limit = 8,
+): Promise<string[]> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.learnedScripts)
+    .orderBy(desc(schema.learnedScripts.id))
+    .limit(limit);
+  return rows.map((r) => r.text);
+}
+
+// 案件确认收款后调用：把该案最近未提的模型回复提进话术库，归一化去重。
+async function promoteLearnedScripts(
+  ctx: Ctx,
+  caseId: number,
+): Promise<number> {
+  const db = ctx.db<typeof schema>();
+  const replies = await db
+    .select()
+    .from(schema.modelReplies)
+    .where(
+      and(
+        eq(schema.modelReplies.caseId, caseId),
+        eq(schema.modelReplies.promoted, false),
+      ),
+    )
+    .orderBy(desc(schema.modelReplies.id))
+    .limit(10);
+  let added = 0;
+  for (const r of replies) {
+    const normalized = normalizeScript(r.reply);
+    if (!normalized || normalized.length < 4) continue;
+    const exists = await db
+      .select({ id: schema.learnedScripts.id })
+      .from(schema.learnedScripts)
+      .where(eq(schema.learnedScripts.normalized, normalized))
+      .limit(1);
+    if (exists.length > 0) continue;
+    try {
+      await db.insert(schema.learnedScripts).values({
+        text: deNumberScript(r.reply),
+        normalized,
+        trigger: r.trigger,
+        sourceCaseId: caseId,
+      });
+      added++;
+    } catch {
+      // 并发下唯一索引冲突即重复，跳过。
+    }
+    await db
+      .update(schema.modelReplies)
+      .set({ promoted: true })
+      .where(eq(schema.modelReplies.id, r.id));
+  }
+  return added;
 }
 
 /* ---------------- 聊天话术 ----------------
@@ -3879,7 +3967,9 @@ const baseActions = {
       // API key：库里 model_api_key 优先，没有读环境变量 GROQ_API_KEY。
       const apiKey = await loadModelApiKey(ctx);
       // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
-      const system = buildGenerateReplySystem(row);
+      // 已学成功话术一并拼进提示词当示范。
+      const learned = await loadLearnedScripts(ctx);
+      const system = buildGenerateReplySystem(row, learned);
       const history = (args.history ?? []).slice(-6).map((m) => ({
         role: m.role,
         content: m.content,
@@ -3930,7 +4020,18 @@ const baseActions = {
           if (typeof content !== "string" || !content.trim()) {
             return { reply: null, modelAvailable: false };
           }
-          return { reply: content.trim(), modelAvailable: true };
+          const replyText = content.trim();
+          // 记模型回复流水：付款后凭它提进成功话术库。写库失败不影响回话。
+          try {
+            await db.insert(schema.modelReplies).values({
+              caseId: args.caseId,
+              trigger: args.text,
+              reply: replyText,
+            });
+          } catch {
+            // 忽略
+          }
+          return { reply: replyText, modelAvailable: true };
         } catch {
           if (attempt === 0 && Date.now() - startedAt < 5000) {
             await new Promise((r) => setTimeout(r, 1000));
@@ -4228,6 +4329,12 @@ const baseActions = {
           .where(eq(schema.payments.id, inserted.id));
       }
       ctx.invalidateQueries();
+      // 登记还款 = 成功信号：把该案近期模型回复提进成功话术库（去重）。
+      try {
+        await promoteLearnedScripts(ctx, args.caseId);
+      } catch {
+        // 忽略
+      }
       return { id: inserted.id };
     },
   }),
@@ -4330,6 +4437,12 @@ const baseActions = {
         payRows[0]
       ) {
         await learnThenDeleteChat(ctx, payRows[0].caseId);
+        // 对平 = 成功信号：把该案近期模型回复提进成功话术库（去重）。
+        try {
+          await promoteLearnedScripts(ctx, payRows[0].caseId);
+        } catch {
+          // 忽略
+        }
       }
       ctx.invalidateQueries();
       return { ok: true };
