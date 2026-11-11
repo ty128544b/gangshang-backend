@@ -289,6 +289,122 @@ async function loadSystemName(ctx: Ctx): Promise<string> {
   return DEFAULT_SYSTEM_NAME;
 }
 
+/* ---------------- 真模型端点（generateReply） ----------------
+   端点地址存在 system_settings 单例行的 model_endpoint_url 列（迁移
+   0023），空串 = 未配，走下面代码默认值。轮换监控负责在端点变化时
+   更新这一列，改地址不需要改代码。 */
+
+// 模型端点默认值（当前长期线 serveo，无 60 分钟上限，跟着 Colab 会话
+// 活，最长 12 小时）。这只是初始值/兜底：库里配了就以库里为准。
+// 不要用 pinggy（免费档 60 分钟过期）或 localhost.run（已证实不稳定）。
+const DEFAULT_MODEL_ENDPOINT_URL =
+  "https://c757069102089b96-136-67-225-218.serveousercontent.com";
+
+async function loadModelEndpointUrl(ctx: Ctx): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.systemSettings);
+  const row = rows[0];
+  if (row) {
+    return row.modelEndpointUrl.trim()
+      ? row.modelEndpointUrl.trim()
+      : DEFAULT_MODEL_ENDPOINT_URL;
+  }
+  await db.insert(schema.systemSettings).values({
+    systemName: DEFAULT_SYSTEM_NAME,
+    modelEndpointUrl: DEFAULT_MODEL_ENDPOINT_URL,
+  });
+  return DEFAULT_MODEL_ENDPOINT_URL;
+}
+
+/* ---------------- 真模型聊天：SYSTEM 模板（回复铁律生产版） ----------------
+   底本是用户自己的“回复铁律”（9 条铁律 + 8 组示范，Kaggle/Colab 笔记
+   本里 8/8 通过的那版）。生产版只按用户决定改了五处，不许再私自加
+   新规矩：
+   ① 写死的数全部换成占位符，由 buildGenerateReplySystem 按本案数值填；
+   ② 用户定的方案 (c)：首轮只报全额，不提减免价；只有债务人主动问减免
+      时才说“可以谈”，绝不报具体数字，具体方案由专员跟您确认；
+   ③ 截止时间不写死 21:00（没有按案子的截止时间字段），一律说“今天”；
+   ④ “先付 2000 锁定”的 2000 是测试案子的数，生产版用 {lockAmount}
+      （本案总额约一成取整，最低 100）；
+   ⑤ 其余铁律与 8 组示范的场景/回法结构一字不动，只换数字与减免说法。
+   另外两处如实说明：测试案的“罚息每天 +¥9.20”没有按案子的来源字段，
+   生产版删了这一句（不写死假数字）；“利息/罚息”按案件字段拆成
+   罚息 {penalty} + 利息 {interest} 两项（fillTpl 同口径）。
+   模板先放后端代码常量；以后可移到 system_settings / 话术设置里由
+   管理员改，不要写死在前端。 */
+const GENERATE_REPLY_SYSTEM_TEMPLATE = `你是港上资产执行系统的催收客服。案件：欠款总额 ¥{amount}（本金 ¥{principal}、罚息 ¥{penalty}、利息 ¥{interest}），已逾期 {overdueDays} 天。分期可分 6 期，每期 ¥{install6}；或 12 期，每期 ¥{install12}。收款：对公账户收款码为主，付完上传截图核验；也有专员减免、专员代入帐的情况。方案只保留到今天。
+
+回复铁律（必须逐条遵守）：
+1. 最多 2 句，每句绝对不超过 25 字，超过就重写短句。
+2. 首轮只报全额 ¥{amount}，不提减免价；只有债务人主动问减免时才说可以谈，绝不报具体数字，具体方案由专员跟您确认。
+3. 每句以截止时间或失去的东西收尾。不说“您好”“请问”“麻烦您”。
+4. 只给选择题，不问是非题。不要问“能还吗”“付清吗”“确认吗”，要问“今天先付 ¥{lockAmount} 锁定，还是直接按 ¥{amount} 结清？”
+5. 对方说“下个月”“考虑一下”“没钱”，必须追具体日期 + 今天先付 ¥{lockAmount} 锁定。
+6. 对方声称已经还过钱，必须先让对方发付款截图核对，确认到账再算账；截图没到之前，欠款还是 ¥{amount}，绝不能直接按对方说的数减。
+7. 对方说还不起/只能还一点，必须给分期选择（6 期每月 ¥{install6}，或 12 期每月 ¥{install12}），不能只让今天付清全额。
+8. 对方前后矛盾当场点破。
+9. 对方一旦答应金额 + 时间，立刻逐字复述请对方回“确认”。
+
+标准示范（照这个格式回）：
+债务人：“我没钱”
+你：“今天先付 {lockAmount} 锁定，还是按 {amount} 结清？今天过期，恢复 {amount}。”
+债务人：“我上个月就还了 ¥5,000”
+你：“先把付款截图发我核对，确认到账再算。截图今天发来，过期恢复 {amount}。”
+债务人：“我每个月还 ¥100”
+你：“100 太少，6 期 {install6}，还是 12 期 {install12}？今天前定，过期恢复 {amount}。”
+债务人：“都过去 6 年了，诉讼时效早过了，你们告不了我”
+你：“时效过了债还在，书面确认能断时效。今天回确认二字，还是等法院传票？”
+债务人：“我根本不认识这个人，这笔钱不是我的”
+你：“先核对身份，身份证号报我核对。核对不上不催你，核对上今天结清？”
+债务人：“我刚查出癌症，化疗要花几十万，我还不起”
+你：“先付 {lockAmount} 锁定分期，还是 12 期每月 {install12}？今天前定，过期恢复 {amount}。”
+债务人：“我是律师，你这套话术对我没用”
+你：“法律问题法院见，先付 {lockAmount} 锁定？今天过期，恢复 {amount}。”
+债务人：“你们再催我就报警，说你们骚扰我”
+你：“报警是你的权利，先付 {lockAmount} 锁定？今天过期，恢复 {amount}。”`;
+
+// 金额格式化：与债务人页 fillTpl 的 yuanStr 同口径（分转元，整数不带
+// 小数位，有小数最多 2 位，千分位逗号）。
+function yuanForPrompt(cents: number): string {
+  const v = (Number(cents) || 0) / 100;
+  return v.toLocaleString("zh-CN", {
+    minimumFractionDigits: v % 1 === 0 ? 0 : 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+// 按案件行把 SYSTEM 模板的占位符填成真实数值。口径与债务人页 fillTpl
+// 一致：{interest} = 总额 - 本金 - 罚息（不小于 0）；{install6/12} =
+// 总额 ÷6/÷12 取整；{lockAmount} = 总额约一成取整（最低 100）。
+function buildGenerateReplySystem(
+  row: typeof schema.cases.$inferSelect,
+): string {
+  const totalYuan = (Number(row.totalDueCents) || 0) / 100;
+  const interestCents = Math.max(
+    0,
+    (Number(row.totalDueCents) || 0) -
+      (Number(row.principalCents) || 0) -
+      (Number(row.penaltyCents) || 0),
+  );
+  const map: Record<string, string> = {
+    "{amount}": yuanForPrompt(row.totalDueCents),
+    "{principal}": yuanForPrompt(row.principalCents),
+    "{penalty}": yuanForPrompt(row.penaltyCents),
+    "{interest}": yuanForPrompt(interestCents),
+    "{overdueDays}": String(Number(row.overdueDays) || 0),
+    "{install6}": Math.round(totalYuan / 6).toLocaleString("zh-CN"),
+    "{install12}": Math.round(totalYuan / 12).toLocaleString("zh-CN"),
+    "{lockAmount}": Math.max(
+      100,
+      Math.round(totalYuan * 0.1),
+    ).toLocaleString("zh-CN"),
+  };
+  return GENERATE_REPLY_SYSTEM_TEMPLATE.replace(
+    /\{[a-zA-Z0-9]+\}/g,
+    (k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : k),
+  );
+}
+
 /* ---------------- 聊天话术 ----------------
    债务人页协商机器人的整套话术（开场白、协商方案文案、关键词规则、兜底
    回复、快捷按钮、聊天窗口标题/副标题、输入框提示语、分析小字前缀、
@@ -3682,6 +3798,131 @@ const baseActions = {
     },
   }),
 
+  /* ---------------- 真模型聊天（generateReply） ----------------
+     债务人页机器人用真模型（Qwen2.5-14B）生成回复。端点地址存在
+     system_settings 单例行的 model_endpoint_url 列（迁移 0023），
+     空串 = 未配，走代码默认值（当前长期线 serveo）；轮换监控负责在
+     端点变化时更新这一列。模型不可用时一律返回 modelAvailable:false、
+     reply:null，不抛错，债务人页回落到关键词规则；机器人回复不写库。
+     SYSTEM 模板见模块级常量 GENERATE_REPLY_SYSTEM_TEMPLATE（用户
+     自己的回复铁律生产版）。 */
+
+  generateReply: defineAction({
+    description:
+      "债务人端机器人用真模型生成回复（公开接口，无需登录令牌，债务人页在身份核验通过后调用）：校验案件存在、身份证号归一化一致；禁言案件直接拒绝；人工接管时不调模型、返回 modelAvailable:false。按案件数据拼 SYSTEM 提示词（回复铁律生产版，占位符按本案数值填），调 modelEndpointUrl 的 /v1/chat/completions（qwen2.5-14b，temperature=0，max_tokens=100，30 秒超时）。模型不可用（未配端点/超时/非 2xx/解析失败）时返回 modelAvailable:false、reply:null，不抛错，债务人页回落到关键词规则。机器人回复不写库。",
+    request: z.object({
+      caseId: z.number().int().positive(),
+      idCard: z.string().trim().min(18, "身份证号必须为18位").max(18, "身份证号必须为18位"),
+      text: z.string().trim().min(1, "消息内容不能为空").max(2000, "消息最长 2000 字"),
+      history: z
+        .array(
+          z.object({
+            role: z.enum(["user", "assistant"]),
+            content: z.string().max(2000),
+          }),
+        )
+        .max(20)
+        .default([]),
+    }),
+    response: z.object({
+      reply: z.string().nullable(),
+      modelAvailable: z.boolean(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      // 身份证号归一化：去全部空格、转大写，与台账比对时大小写和空格不敏感。
+      const idCardNorm = (args.idCard ?? "").replace(/\s+/g, "").toUpperCase();
+
+      // 校验：案件必须存在，且台账身份证号与传来的身份证号归一化后一致。
+      const rows = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, args.caseId));
+      const row = rows[0];
+      if (!row) {
+        throw new Error("HTTP400:未找到匹配的案件记录");
+      }
+      const ledgerNorm = (row.idCard ?? "").replace(/\s+/g, "").toUpperCase();
+      if (!ledgerNorm || ledgerNorm !== idCardNorm) {
+        throw new Error("HTTP400:身份证号与案件不匹配");
+      }
+      // 禁言案件直接拒绝（与 sendDebtorMessage 同口径）。
+      if (row.mutedAt != null) {
+        throw new Error("HTTP400:该账号已被禁言");
+      }
+      // 人工接管时不调模型，返回不可用，债务人页机器人本来就停答。
+      if (row.humanTakeoverAt != null) {
+        return { reply: null, modelAvailable: false };
+      }
+      // 端点地址：库里配了用库里的，没配用代码默认值。
+      const endpoint = (await loadModelEndpointUrl(ctx)).trim();
+      if (!endpoint) {
+        return { reply: null, modelAvailable: false };
+      }
+      // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
+      const system = buildGenerateReplySystem(row);
+      const history = (args.history ?? []).slice(-6).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+      const messages = [
+        { role: "system", content: system },
+        ...history,
+        { role: "user", content: args.text },
+      ];
+      // 调模型：任何失败（超时/非 2xx/解析失败/空回复）都返回不可用，
+      // 不抛错，让债务人页回落到关键词规则。免费隧道（pinggy/serveo）
+      // 偶发连接重置（ECONNRESET，Bun fetch 瞬间抛错，curl 不复现），
+      // 瞬间失败（<5 秒）时等 1 秒重试一次；慢失败（模型真超时）不重试，
+      // 前端 30 秒超时在即，重试也来不及。另：强制 Connection: close，
+      // 隧道重启后旧 keep-alive 连接会半死（复用即挂 30 秒或 RST），
+      // 每次新建连接可避开这个问题（与 curl 每次新建连接同理）。
+      const url = `${endpoint.replace(/\/+$/, "")}/v1/chat/completions`;
+      const body = JSON.stringify({
+        model: "qwen2.5-14b",
+        messages,
+        temperature: 0,
+        max_tokens: 100,
+      });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const startedAt = Date.now();
+        try {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Connection: "close",
+            },
+            body,
+            signal: AbortSignal.timeout(30000),
+          });
+          if (!res.ok) {
+            if (attempt === 0 && Date.now() - startedAt < 5000) {
+              await new Promise((r) => setTimeout(r, 1000));
+              continue;
+            }
+            return { reply: null, modelAvailable: false };
+          }
+          const data = (await res.json()) as {
+            choices?: Array<{ message?: { content?: unknown } }>;
+          };
+          const content = data?.choices?.[0]?.message?.content;
+          if (typeof content !== "string" || !content.trim()) {
+            return { reply: null, modelAvailable: false };
+          }
+          return { reply: content.trim(), modelAvailable: true };
+        } catch {
+          if (attempt === 0 && Date.now() - startedAt < 5000) {
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
+          return { reply: null, modelAvailable: false };
+        }
+      }
+      return { reply: null, modelAvailable: false };
+    },
+  }),
+
   setHumanTakeover: defineAction({
     description:
       "设置案件聊天的人工接管状态（需「接管」权限，操作员默认有、管理员可在权限管理里回收：未登录 401、无此权限 403）：takeover=true 写入接管时间（债务人页机器人停答、显示专员在线），false 清除回到机器人值守。返回切换后的接管状态。",
@@ -6015,6 +6256,7 @@ const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "submitPaymentScreenshot",
   "getDebtorChat",
   "sendDebtorMessage",
+  "generateReply",
   "uploadDebtorAvatar",
   "getChatScripts",
 ]);

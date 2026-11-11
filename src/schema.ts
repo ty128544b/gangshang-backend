@@ -371,6 +371,10 @@ export const verifyAttempts = sqliteTable("verify_attempts", {
 export const systemSettings = sqliteTable("system_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   systemName: text("system_name").notNull().default(""),
+  // 模型端点（真模型聊天 generateReply 调的 llama-server 公网地址）：
+  // 空串 = 未配，走代码默认值（当前长期线 serveo）。轮换监控负责在
+  // 端点变化时更新这一列；后端只读这一列，不再写死地址。
+  modelEndpointUrl: text("model_endpoint_url").notNull().default(""),
 });
 
 /* ---------------- 聊天话术（债务人页协商机器人脚本） ---------------- */
