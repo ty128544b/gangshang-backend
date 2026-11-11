@@ -474,3 +474,31 @@ export const learnedScripts = sqliteTable("learned_scripts", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// 操作审计日志：谁、在什么时候、对什么做了什么。删改操作必记，
+// 出问题时先查这里，定位是谁、什么时候、改了什么。
+export const auditLogs = sqliteTable("audit_logs", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  actor: text("actor").notNull().default(""),
+  action: text("action").notNull(),
+  targetKind: text("target_kind").notNull().default(""),
+  targetId: integer("target_id"),
+  detail: text("detail").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// 回收站：删除前把整条数据（含关联记录）快照成 JSON 存这里，
+// 删错了可以从回收站恢复，不用整库回滚。
+export const deletedItems = sqliteTable("deleted_items", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  kind: text("kind").notNull(),
+  itemId: integer("item_id"),
+  label: text("label").notNull().default(""),
+  data: text("data").notNull(),
+  deletedBy: text("deleted_by").notNull().default(""),
+  deletedAt: integer("deleted_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});

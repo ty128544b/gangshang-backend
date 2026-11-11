@@ -577,6 +577,115 @@ async function promoteLearnedScripts(
   return added;
 }
 
+/* ---------------- 操作审计 + 回收站 ----------------
+   操作失误的防护：删改操作先记审计（谁、什么时候、改了什么），
+   删除案件/还款前先把整条数据（含关联记录）快照进回收站，删错了
+   可以单条恢复，不用整库回滚。审计与归档失败不影响主操作本身。 */
+
+// 当前操作人显示名：优先取登录用户的显示名，没有就取 admin。
+function auditActor(ctx: Ctx): string {
+  const session = currentSession(ctx);
+  if (!session) return "admin";
+  if (session.role === "admin") return "管理员";
+  return (session.displayName || session.username || "操作员").trim();
+}
+
+async function logAudit(
+  ctx: Ctx,
+  action: string,
+  targetKind: string,
+  targetId: number | null,
+  detail: string,
+): Promise<void> {
+  try {
+    const db = ctx.db<typeof schema>();
+    await db.insert(schema.auditLogs).values({
+      actor: auditActor(ctx),
+      action,
+      targetKind,
+      targetId,
+      detail: detail.slice(0, 2000),
+    });
+  } catch {
+    // 审计失败不影响主操作。
+  }
+}
+
+// 把一个案件及其全部关联记录快照进回收站，返回回收站 id。
+async function archiveCase(
+  ctx: Ctx,
+  caseId: number,
+): Promise<number | null> {
+  const db = ctx.db<typeof schema>();
+  try {
+    const caseRows = await db
+      .select()
+      .from(schema.cases)
+      .where(eq(schema.cases.id, caseId))
+      .limit(1);
+    if (caseRows.length === 0) return null;
+    const [steps, sends, chats, agreements, payments] = await Promise.all([
+      db.select().from(schema.progressSteps).where(eq(schema.progressSteps.caseId, caseId)),
+      db.select().from(schema.sendRecords).where(eq(schema.sendRecords.caseId, caseId)),
+      db.select().from(schema.chatMessages).where(eq(schema.chatMessages.caseId, caseId)),
+      db.select().from(schema.agreements).where(eq(schema.agreements.caseId, caseId)),
+      db.select().from(schema.payments).where(eq(schema.payments.caseId, caseId)),
+    ]);
+    const snapshot = {
+      case: caseRows[0],
+      progressSteps: steps,
+      sendRecords: sends,
+      chatMessages: chats,
+      agreements,
+      payments,
+    };
+    const label = `${caseRows[0].caseNo ?? ""} ${caseRows[0].debtorName ?? ""}`.trim();
+    const inserted = await db
+      .insert(schema.deletedItems)
+      .values({
+        kind: "case",
+        itemId: caseId,
+        label,
+        data: JSON.stringify(snapshot),
+        deletedBy: auditActor(ctx),
+      })
+      .returning({ id: schema.deletedItems.id });
+    return inserted[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// 把一条还款记录快照进回收站。
+async function archivePayment(
+  ctx: Ctx,
+  paymentId: number,
+): Promise<number | null> {
+  const db = ctx.db<typeof schema>();
+  try {
+    const rows = await db
+      .select()
+      .from(schema.payments)
+      .where(eq(schema.payments.id, paymentId))
+      .limit(1);
+    if (rows.length === 0) return null;
+    const label = `还款 ${rows[0].amountCents ?? ""} 分（案件 ${rows[0].caseId ?? ""}）`;
+    const inserted = await db
+      .insert(schema.deletedItems)
+      .values({
+        kind: "payment",
+        itemId: paymentId,
+        label,
+        data: JSON.stringify({ payment: rows[0] }),
+        deletedBy: auditActor(ctx),
+      })
+      .returning({ id: schema.deletedItems.id });
+    return inserted[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /* ---------------- 聊天话术 ----------------
    债务人页协商机器人的整套话术（开场白、协商方案文案、关键词规则、兜底
    回复、快捷按钮、聊天窗口标题/副标题、输入框提示语、分析小字前缀、
@@ -3383,29 +3492,55 @@ const baseActions = {
   }),
 
   updateCase: defineAction({
-    description: "保存一个案件的欠款内容（债务人、金额、逾期、罚息、债权方等）。",
+    description: "保存一个案件的欠款内容（债务人、金额、逾期、罚息、债权方等）。修改记审计日志（改前改后关键字段）。",
     request: z.object({ id: z.number().int().positive(), ...caseFields }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const { id, ...fields } = args;
       await assertCaseVisible(ctx, id);
+      // 改前快照关键字段，记审计，改错了能查到原来是多少。
+      const before = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, id))
+        .limit(1);
       await db
         .update(schema.cases)
         .set({ ...fields, idCard: fields.idCard.trim().toUpperCase(), updatedAt: new Date() })
         .where(eq(schema.cases.id, id));
+      const b = before[0];
+      if (b) {
+        const changed: string[] = [];
+        const watch: [string, unknown, unknown][] = [
+          ["总额", b.totalDueCents, fields.totalDueCents],
+          ["本金", b.principalCents, fields.principalCents],
+          ["罚息", b.penaltyCents, fields.penaltyCents],
+          ["逾期天数", b.overdueDays, fields.overdueDays],
+          ["债务人", b.debtorName, fields.debtorName],
+          ["案号", b.caseNo, fields.caseNo],
+        ];
+        for (const [name, oldV, newV] of watch) {
+          if (String(oldV ?? "") !== String(newV ?? "")) {
+            changed.push(`${name}: ${oldV} → ${newV}`);
+          }
+        }
+        await logAudit(ctx, "update_case", "case", id, changed.length > 0 ? changed.join("; ") : "保存案件（无关键字段变化）");
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
   }),
 
   deleteCase: defineAction({
-    description: "删除一个案件及其全部进度步骤与发送记录。",
+    description: "删除一个案件及其全部进度步骤与发送记录。删除前先把整条案件（含进度、发送、聊天、协议、还款）快照进回收站，删错了可以从回收站恢复。",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       await assertCaseVisible(ctx, args.id);
+      // 先归档进回收站，再删；归档失败也不拦删除（审计里会记）。
+      const archiveId = await archiveCase(ctx, args.id);
       await db.batch([
         db.delete(schema.progressSteps).where(eq(schema.progressSteps.caseId, args.id)),
         db.delete(schema.sendRecords).where(eq(schema.sendRecords.caseId, args.id)),
@@ -3414,20 +3549,150 @@ const baseActions = {
         db.delete(schema.payments).where(eq(schema.payments.caseId, args.id)),
         db.delete(schema.cases).where(eq(schema.cases.id, args.id)),
       ]);
+      await logAudit(ctx, "delete_case", "case", args.id, `删除案件 ${args.id}，回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
   }),
 
+  // 回收站：列出已删除的案件/还款，可单条恢复。
+  listDeletedItems: defineAction({
+    description: "列出回收站里的已删除项（案件与还款），最新在前。",
+    request: z.object({}),
+    response: z.object({
+      items: z.array(
+        z.object({
+          id: z.number(),
+          kind: z.string(),
+          itemId: z.number().nullable(),
+          label: z.string(),
+          deletedBy: z.string(),
+          deletedAt: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.deletedItems)
+        .orderBy(desc(schema.deletedItems.id))
+        .limit(100);
+      return {
+        items: rows.map((r) => ({
+          id: r.id,
+          kind: r.kind,
+          itemId: r.itemId,
+          label: r.label,
+          deletedBy: r.deletedBy,
+          deletedAt: (r.deletedAt as Date).toISOString(),
+        })),
+      };
+    },
+  }),
+
+  restoreDeletedItem: defineAction({
+    description: "从回收站恢复一条已删除的案件或还款（把快照原样插回）。仅管理员可用。",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const session = currentSession(ctx);
+      if (!session || session.role !== "admin") {
+        throw new Error("HTTP403:仅管理员可以从回收站恢复");
+      }
+      const rows = await db
+        .select()
+        .from(schema.deletedItems)
+        .where(eq(schema.deletedItems.id, args.id))
+        .limit(1);
+      if (rows.length === 0) throw new Error("HTTP404:回收站里没有这一条");
+      const item = rows[0];
+      const snapshot = JSON.parse(item.data) as Record<string, unknown>;
+      if (item.kind === "case") {
+        const s = snapshot as {
+          case: Record<string, unknown>;
+          progressSteps: Record<string, unknown>[];
+          sendRecords: Record<string, unknown>[];
+          chatMessages: Record<string, unknown>[];
+          agreements: Record<string, unknown>[];
+          payments: Record<string, unknown>[];
+        };
+        // 原 id 已删，直接按快照插回（含原 id）。
+        const stripId = (r: Record<string, unknown>): Record<string, unknown> => {
+          const { id: _id, ...rest } = r;
+          return rest;
+        };
+        await db.insert(schema.cases).values({ ...(stripId(s.case) as Record<string, unknown>), id: s.case.id as number } as never);
+        for (const r of s.progressSteps ?? []) await db.insert(schema.progressSteps).values(stripId(r) as never);
+        for (const r of s.sendRecords ?? []) await db.insert(schema.sendRecords).values(stripId(r) as never);
+        for (const r of s.chatMessages ?? []) await db.insert(schema.chatMessages).values(stripId(r) as never);
+        for (const r of s.agreements ?? []) await db.insert(schema.agreements).values(stripId(r) as never);
+        for (const r of s.payments ?? []) await db.insert(schema.payments).values(stripId(r) as never);
+      } else if (item.kind === "payment") {
+        const s = snapshot as { payment: Record<string, unknown> };
+        const { id: _id, ...rest } = s.payment;
+        await db.insert(schema.payments).values({ ...(rest as Record<string, unknown>), id: s.payment.id as number } as never);
+      } else {
+        throw new Error("HTTP400:这种类型不支持恢复");
+      }
+      await db.delete(schema.deletedItems).where(eq(schema.deletedItems.id, args.id));
+      await logAudit(ctx, "restore_deleted", item.kind, item.itemId, `从回收站恢复 ${item.kind} ${item.label}`);
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  // 审计日志：列出最近的操作记录，最新在前。
+  listAuditLogs: defineAction({
+    description: "列出最近的操作审计记录（谁、什么时候、做了什么）。",
+    request: z.object({ limit: z.number().int().min(1).max(200).optional() }),
+    response: z.object({
+      logs: z.array(
+        z.object({
+          id: z.number(),
+          actor: z.string(),
+          action: z.string(),
+          targetKind: z.string(),
+          targetId: z.number().nullable(),
+          detail: z.string(),
+          createdAt: z.string(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.auditLogs)
+        .orderBy(desc(schema.auditLogs.id))
+        .limit(args.limit ?? 100);
+      return {
+        logs: rows.map((r) => ({
+          id: r.id,
+          actor: r.actor,
+          action: r.action,
+          targetKind: r.targetKind,
+          targetId: r.targetId,
+          detail: r.detail,
+          createdAt: (r.createdAt as Date).toISOString(),
+        })),
+      };
+    },
+  }),
+
   deleteAllCases: defineAction({
     description:
-      "一键删除全部案件及其全部进度、发送记录、聊天、协议、还款记录、链接点击与登录记录，不可恢复。管理员与用户账号均可用。",
+      "一键删除全部可见案件及其全部进度、发送记录、聊天、协议、还款记录、链接点击与登录记录。仅管理员可用；删除前每个案件先快照进回收站，删错了可以单条恢复。",
     request: z.object({}),
     response: z.object({ ok: z.boolean(), deletedCount: z.number() }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
-      // 分案可见范围：普通操作员「删除全部」只删自己名下的案件（连同其
-      // 关联记录），删不到别人名下的；管理员与分案主管才是全删。
+      // 仅管理员可用：普通操作员误点「删除全部」是最大的误删风险。
+      const session = currentSession(ctx);
+      if (!session || session.role !== "admin") {
+        throw new Error("HTTP403:仅管理员可以删除全部案件");
+      }
       const visible = await visibleCaseIds(ctx);
       const existing = await db
         .select({ id: schema.cases.id })
@@ -3435,6 +3700,10 @@ const baseActions = {
       const targetIds = visible
         ? existing.map((r) => r.id).filter((id) => visible.has(id))
         : existing.map((r) => r.id);
+      // 先把每个案件快照进回收站，再删。
+      for (const id of targetIds) {
+        await archiveCase(ctx, id);
+      }
       if (visible) {
         if (targetIds.length > 0) {
           await db.batch([
@@ -3448,6 +3717,7 @@ const baseActions = {
             db.delete(schema.cases).where(inArray(schema.cases.id, targetIds)),
           ]);
         }
+        await logAudit(ctx, "delete_all_cases", "case", null, `删除全部案件 ${targetIds.length} 个，已进回收站`);
         ctx.invalidateQueries();
         return { ok: true, deletedCount: targetIds.length };
       }
@@ -3461,6 +3731,7 @@ const baseActions = {
         db.delete(schema.debtorLogins),
         db.delete(schema.cases),
       ]);
+      await logAudit(ctx, "delete_all_cases", "case", null, `删除全部案件 ${existing.length} 个，已进回收站`);
       ctx.invalidateQueries();
       return { ok: true, deletedCount: existing.length };
     },
@@ -4528,7 +4799,7 @@ const baseActions = {
   }),
 
   deletePayment: defineAction({
-    description: "删除一笔还款记录。",
+    description: "删除一笔还款记录。删除前先快照进回收站，删错了可以恢复。",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
@@ -4539,9 +4810,11 @@ const baseActions = {
         .where(eq(schema.payments.id, args.id))
         .limit(1);
       if (payRows[0]) await assertCaseVisible(ctx, payRows[0].caseId);
+      const archiveId = await archivePayment(ctx, args.id);
       await db
         .delete(schema.payments)
         .where(eq(schema.payments.id, args.id));
+      await logAudit(ctx, "delete_payment", "payment", args.id, `删除还款记录 ${args.id}（案件 ${payRows[0]?.caseId ?? ""}），回收站 ${archiveId ?? "归档失败"}`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -6530,6 +6803,9 @@ const CASE_WRITE_ACTIONS: ReadonlySet<string> = new Set([
   "updateCase",
   "deleteCase",
   "deleteAllCases",
+  "listDeletedItems",
+  "restoreDeletedItem",
+  "listAuditLogs",
   "addStep",
   "updateStep",
   "deleteStep",
