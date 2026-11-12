@@ -4650,7 +4650,27 @@ const baseActions = {
           if (typeof content !== "string" || !content.trim()) {
             return { reply: null, modelAvailable: false };
           }
-          const replyText = content.trim();
+          let replyText = content.trim();
+          // 模型回话硬过滤（用户 2026-11-12 亲定：AI 不能乱回答到账/核销）：
+          // 模型看不到图片也查不到流水，文字防线没拦住时（比如债务人只说
+          // “钱过去了”），它仍可能凭空说“到账了/已核销”。只要回话里出现
+          // 肯定到账/核销的说法，一律换成固定转接话术并标待人工处理。
+          // 只认肯定句（“还没到账”不触发）；裸“收到了”太含糊不拦，靠
+          // 债务人消息侧的付款防线挡。替换发生在记流水之前，幻觉回话
+          // 不会进 model_replies、不会被学进成功话术。
+          const RECEIPT_CLAIM_RE =
+            /到账了|已到账|已核销|核销完成|已收到款|收到款了|款已到账|已确认收款|确认收款|已入账|入账完成|已到款|到款了/;
+          if (RECEIPT_CLAIM_RE.test(replyText)) {
+            try {
+              await db
+                .update(schema.cases)
+                .set({ needsHuman: 1 })
+                .where(eq(schema.cases.id, args.caseId));
+            } catch {
+              // 忽略
+            }
+            replyText = "请稍等，财务核验中，请稍等。";
+          }
           // 记模型回复流水：付款后凭它提进成功话术库。写库失败不影响回话。
           try {
             await db.insert(schema.modelReplies).values({
