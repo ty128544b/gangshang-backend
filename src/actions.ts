@@ -27,6 +27,8 @@ const caseFields = {
   note: z.string().default(""),
   education: z.string().default(""),
   occupation: z.string().default(""),
+  // 月收入（分）：导入时可填；沟通中抽到后自动回写；管理员可在案件里改。
+  monthlyIncomeCents: z.number().int().nonnegative().default(0),
   backgroundNote: z.string().default(""),
 };
 
