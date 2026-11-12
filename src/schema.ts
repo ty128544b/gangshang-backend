@@ -86,6 +86,26 @@ export const chatMessages = sqliteTable("chat_messages", {
     .$defaultFn(() => new Date()),
 });
 
+/* ---------------- 拒不还款责任书 ----------------
+   债务人说“不还”时系统自动生成一份待签署的责任书（内容按话术设置里的
+   责任书模板 + 案件真实数据填充，快照存 content）；债务人在网页上手写
+   签名后 status 变 signed，签名图存 blobs（liability-signatures/<id>-<随机>）。
+   已有待签署的不会重复生成；已签过的再拒付才生成新的一份。 */
+export const liabilityDocuments = sqliteTable("liability_documents", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  caseId: integer("case_id").notNull(),
+  title: text("title").notNull().default("有还款能力拒不还款责任书"),
+  content: text("content").notNull().default(""),
+  status: text("status", { enum: ["pending", "signed"] })
+    .notNull()
+    .default("pending"),
+  signatureBlobKey: text("signature_blob_key"),
+  signedAt: integer("signed_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const agreements = sqliteTable("agreements", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   caseId: integer("case_id").notNull(),

@@ -810,6 +810,11 @@ const chatScriptsOut = z.object({
     paidButtonText: z.string(),
   }),
   paidMessageTemplate: z.string(),
+  // 拒不还款责任书模板：债务人说“不还”时后端按此模板 + 案件真实数据
+  // 生成待签署的责任书（{debtorName} {caseNo} {amount} {overdueDays}
+  // {agreementNo} {date} 由后端填充，模板里不写死具体案件的数字）。
+  // 模板里必须写明拒不还款的法律后果；后台「话术设置」可改。
+  liabilityDocTemplate: z.string(),
   // v17 已确认技巧（技巧库里 status=confirmed 的 technique 文本，
   // 按确认时间倒序）：机器人值守时自动回复可照着用；模型接进生产
   // 聊天后也读这份。未确认的待确认技巧不在这里。
@@ -945,6 +950,38 @@ const DEFAULT_CHAT_SCRIPTS: ChatScriptsData = {
     paidButtonText: "我已付款 · 上传截图",
   },
   paidMessageTemplate: "我已付款，金额X，已上传截图。",
+  liabilityDocTemplate: `有还款能力拒不还款责任书
+
+立书人（债务人）：{debtorName}
+身份证号码：{idCard}
+联系电话：{phone}
+案件编号：{caseNo}
+
+债权人：港上资产执行系统（债权受让方）
+原债权人：{originalCreditor}
+债权转让协议编号：{agreementNo}
+
+一、欠款事实确认
+立书人确认：本人对债权人负有债务，欠款金额共计{amount}元，其中本金{principal}元，已逾期{overdueDays}天。上述债权合法有效，债权转让事宜已通知本人，本人对此无异议。
+
+二、拒不还款的确认
+经债权人多次协商催收，本人明确表示拒绝履行还款义务。本人郑重确认：本人具备还款能力，但坚持拒不还款。本确认书是本人的真实意思表示，不存在欺诈、胁迫、重大误解等情形。
+
+三、法律后果告知
+本人已清楚知悉，拒不履行还款义务将产生以下法律后果：
+（一）债权人有权依据《中华人民共和国民法典》第五百零九条、第五百七十七条的规定，要求本人继续履行还款义务，并承担逾期利息、违约金及债权人为实现债权支出的诉讼费、律师费、保全费等费用；
+（二）债权人有权向人民法院提起诉讼或申请强制执行。人民法院可依据《中华人民共和国民事诉讼法》第二百五十三条、第二百五十四条、第二百五十五条的规定，查询、冻结、划拨本人的银行存款、微信及支付宝资金，扣留、提取本人工资收入，查封、扣押、拍卖、变卖本人名下财产；
+（三）本人将被人民法院纳入失信被执行人名单，依法受到信用惩戒（《最高人民法院关于公布失信被执行人名单信息的若干规定》第一条），并被采取限制消费措施（《最高人民法院关于限制被执行人高消费及有关消费的若干规定》第一条、第三条），不得乘坐飞机、列车软卧、轮船二等以上舱位，不得在星级以上宾馆、酒店等场所进行高消费，不得购买不动产，不得让子女就读高收费私立学校；违反限制消费令的，依照《中华人民共和国民事诉讼法》第一百一十一条的规定予以拘留、罚款；
+（四）有能力执行而拒不执行人民法院判决、裁定，情节严重的，依据《中华人民共和国刑法》第三百一十三条，将以拒不执行判决、裁定罪追究刑事责任，处三年以下有期徒刑、拘役或者罚金；情节特别严重的，处三年以上七年以下有期徒刑，并处罚金。
+
+四、承诺与声明
+本人承诺：本责任书内容真实、准确。本人是在充分了解上述法律后果的情况下，自愿签署本责任书。本责任书一经签署即具有法律效力，债权人有权将其作为向人民法院主张权利的证据使用。
+
+五、签署方式
+本责任书以电子签名方式签署。签署人在签署前已通过手机号与身份证号核验身份；依据《中华人民共和国电子签名法》第十四条，可靠的电子签名与手写签名具有同等的法律效力。本责任书自签署之日起生效。
+
+立书人（签名）：{debtorName}
+签署日期：{date}`,
   // v17：默认无已确认技巧；有确认技巧时 loadChatScripts 从技巧库补上。
   confirmedTechniques: [],
 };
@@ -1107,6 +1144,10 @@ async function loadChatScripts(ctx: Ctx): Promise<ChatScriptsData> {
     paidMessageTemplate: setting(
       "paidMessageTemplate",
       defaults.paidMessageTemplate,
+    ),
+    liabilityDocTemplate: setting(
+      "liabilityDocTemplate",
+      defaults.liabilityDocTemplate,
     ),
     confirmedTechniques,
   };
@@ -2448,6 +2489,90 @@ async function computeOperatorPerformance(
   }
   return rows;
 }
+
+/* ============ 拒不还款责任书 ============
+   债务人说“不还”就生成一份待签署的责任书：内容按话术设置里的责任书
+   模板 + 案件真实数据填充（姓名、身份证号、电话、案号、金额、本金、
+   逾期天数、转让协议号、原债权人、签署日期），快照存 content；
+   债务人在网页上手写签名后状态变 signed，签名图存 blobs。法条出处：
+   民法典 509/577、民诉法 2023 版 253/254/255/111、失信名单规定第1条、
+   限高规定第1/3条、刑法 313 条、电子签名法 14 条（已核对最高法官网）。
+   模板在后台「话术设置」里可改，法条与措辞以用户/律师定稿为准。 */
+const LIABILITY_REFUSAL_RE = /不还|拒不|拒绝还|不给钱|起诉我|随便起诉/;
+const LIABILITY_DOC_TITLE = "有还款能力拒不还款责任书";
+
+function fillLiabilityDocTemplate(
+  tpl: string,
+  c: {
+    debtorName: string;
+    idCard: string;
+    phone: string;
+    caseNo: string;
+    totalDueCents: number;
+    principalCents: number;
+    overdueDays: number;
+    transferAgreementNo: string;
+    originalCreditor: string;
+  },
+): string {
+  const yuan = (cents: number) =>
+    (cents / 100).toLocaleString("zh-CN", {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
+    });
+  const now = new Date();
+  const date = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日`;
+  return tpl
+    .replaceAll("{debtorName}", c.debtorName || "")
+    .replaceAll("{idCard}", c.idCard || "")
+    .replaceAll("{phone}", c.phone || "")
+    .replaceAll("{caseNo}", c.caseNo || "")
+    .replaceAll("{amount}", yuan(c.totalDueCents))
+    .replaceAll("{principal}", yuan(c.principalCents))
+    .replaceAll("{overdueDays}", String(c.overdueDays || 0))
+    .replaceAll("{agreementNo}", c.transferAgreementNo || "")
+    .replaceAll("{originalCreditor}", c.originalCreditor || "")
+    .replaceAll("{date}", date);
+}
+
+async function createLiabilityDocument(ctx: Ctx, caseId: number) {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.cases)
+    .where(eq(schema.cases.id, caseId))
+    .limit(1);
+  const c = rows[0];
+  if (!c) return null;
+  // 已有待签署的就不再重复生成（同一份弹出即可）；已签过的再拒付才生成新的一份。
+  const pending = await db
+    .select()
+    .from(schema.liabilityDocuments)
+    .where(
+      and(
+        eq(schema.liabilityDocuments.caseId, caseId),
+        eq(schema.liabilityDocuments.status, "pending"),
+      ),
+    )
+    .limit(1);
+  if (pending[0]) return { id: pending[0].id, status: pending[0].status };
+  const scripts = await loadChatScripts(ctx);
+  const content = fillLiabilityDocTemplate(scripts.liabilityDocTemplate, c);
+  const inserted = await db
+    .insert(schema.liabilityDocuments)
+    .values({ caseId, title: LIABILITY_DOC_TITLE, content, status: "pending" })
+    .returning({ id: schema.liabilityDocuments.id });
+  const doc = inserted[0];
+  if (!doc) return null;
+  await db.insert(schema.chatMessages).values({
+    caseId,
+    sender: "system",
+    text: "系统已生成《有还款能力拒不还款责任书》。拒不还款将面临强制执行、财产冻结扣划、列入失信名单、限制高消费等法律后果，情节严重的将追究拒不执行判决、裁定罪的刑事责任，请认真阅读并签署。",
+  });
+  ctx.invalidateQueries();
+  return { id: doc.id, status: "pending" };
+}
+
 
 const baseActions = {
   listCases: defineAction({
@@ -4045,6 +4170,18 @@ const baseActions = {
     response: z.object({
       messages: z.array(chatMessageOut),
       agreements: z.array(agreementOut),
+      // 该案的全部责任书（新的在前）：后台聊天里显示待签署/已签署与签名图。
+      liabilityDocuments: z.array(
+        z.object({
+          id: z.number(),
+          title: z.string(),
+          content: z.string(),
+          status: z.string(),
+          signatureUrl: z.string(),
+          signedAt: z.string().nullable(),
+          createdAt: z.string(),
+        }),
+      ),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -4085,6 +4222,25 @@ const baseActions = {
           status: a.status,
           createdAt: a.createdAt.toISOString(),
         })),
+        liabilityDocuments: await Promise.all(
+          (
+            await db
+              .select()
+              .from(schema.liabilityDocuments)
+              .where(eq(schema.liabilityDocuments.caseId, args.caseId))
+              .orderBy(desc(schema.liabilityDocuments.id))
+          ).map(async (d) => ({
+            id: d.id,
+            title: d.title,
+            content: d.content,
+            status: d.status,
+            signatureUrl: d.signatureBlobKey
+              ? ((await ctx.blobs.getUrl(d.signatureBlobKey)) ?? "")
+              : "",
+            signedAt: d.signedAt ? d.signedAt.toISOString() : null,
+            createdAt: d.createdAt.toISOString(),
+          })),
+        ),
       };
     },
   }),
@@ -4186,6 +4342,134 @@ const baseActions = {
     },
   }),
 
+  /* ============ 拒不还款责任书（电子签名） ============
+     签署方式就是电子签名：债务人在核验身份后，在网页上手写签名，
+     签名图 + 责任书全文快照 + 签署时间一起存库。签署前已通过手机号与
+     身份证号核验身份，签名数据专属于签署人、签署后改动可发现，符合
+     《电子签名法》第十三条可靠电子签名的要求，与手写签名同等效力
+     （第十四条）。内容签署后不再改动，只改状态/签名/签署时间。 */
+
+  sendLiabilityDocument: defineAction({
+    description:
+      "专员手动向案件发送一份《有还款能力拒不还款责任书》待债务人签署（已有待签署的直接返回那份，不重复生成；已签过的再发才生成新的一份）。需登录 + 案件可见（与发聊天消息同权限）。",
+    request: z.object({ caseId: z.number().int().positive() }),
+    response: z.object({ id: z.number(), status: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      await assertCaseVisible(ctx, args.caseId);
+      const doc = await createLiabilityDocument(ctx, args.caseId);
+      if (!doc) throw new Error("未找到该案件");
+      return { id: doc.id, status: doc.status };
+    },
+  }),
+
+  getLiabilityDocument: defineAction({
+    description:
+      "后台查看一份责任书全文与签名图（需登录 + 案件可见）：返回标题、全文快照、状态、签名图地址与签署时间。",
+    request: z.object({ documentId: z.number().int().positive() }),
+    response: z.object({
+      id: z.number(),
+      caseId: z.number(),
+      title: z.string(),
+      content: z.string(),
+      status: z.string(),
+      signatureUrl: z.string(),
+      signedAt: z.string().nullable(),
+      createdAt: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.liabilityDocuments)
+        .where(eq(schema.liabilityDocuments.id, args.documentId))
+        .limit(1);
+      const doc = rows[0];
+      if (!doc) throw new Error("未找到该责任书");
+      await assertCaseVisible(ctx, doc.caseId);
+      return {
+        id: doc.id,
+        caseId: doc.caseId,
+        title: doc.title,
+        content: doc.content,
+        status: doc.status,
+        signatureUrl: doc.signatureBlobKey
+          ? ((await ctx.blobs.getUrl(doc.signatureBlobKey)) ?? "")
+          : "",
+        signedAt: doc.signedAt ? doc.signedAt.toISOString() : null,
+        createdAt: doc.createdAt.toISOString(),
+      };
+    },
+  }),
+
+  signLiabilityDocument: defineAction({
+    description:
+      "债务人电子签署责任书（公开接口，债务人网页在身份核验通过后调用）：校验身份证与台账一致、责任书属于该案件且待签署；签名图（PNG dataBase64，≤1MB）存入 blobs（liability-signatures/<责任书ID>-<随机>），状态变 signed 并记签署时间，同时记一条系统消息，专员在后台聊天里能看到已签署。已签署过的重复提交直接返回原签署时间，不重复记消息。",
+    request: z.object({
+      caseId: z.number().int().positive(),
+      idCard: z.string().trim().min(18, "身份证号必须为18位").max(18, "身份证号必须为18位"),
+      documentId: z.number().int().positive(),
+      signature: z.object({
+        dataBase64: z.string().min(1, "请签名"),
+        mimeType: z.string().regex(/^image\//, "签名必须是图片"),
+      }),
+    }),
+    response: z.object({ ok: z.literal(true), signedAt: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const idCardNorm = (args.idCard ?? "").replace(/\s+/g, "").toUpperCase();
+      const caseRows = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, args.caseId))
+        .limit(1);
+      const c = caseRows[0];
+      if (!c) throw new Error("HTTP400:未找到匹配的案件记录");
+      const ledgerNorm = (c.idCard ?? "").replace(/\s+/g, "").toUpperCase();
+      if (!ledgerNorm || ledgerNorm !== idCardNorm) {
+        throw new Error("HTTP400:身份证号与案件不匹配");
+      }
+      const docRows = await db
+        .select()
+        .from(schema.liabilityDocuments)
+        .where(eq(schema.liabilityDocuments.id, args.documentId))
+        .limit(1);
+      const doc = docRows[0];
+      if (!doc || doc.caseId !== args.caseId) {
+        throw new Error("未找到该责任书");
+      }
+      if (doc.status === "signed") {
+        return {
+          ok: true as const,
+          signedAt: doc.signedAt
+            ? doc.signedAt.toISOString()
+            : new Date().toISOString(),
+        };
+      }
+      const bytes = Buffer.from(args.signature.dataBase64, "base64");
+      if (bytes.length === 0) throw new Error("签名内容为空");
+      if (bytes.length > 1024 * 1024) {
+        throw new Error("HTTP400:签名图片过大");
+      }
+      const key = `liability-signatures/${doc.id}-${randomHex(16)}.png`;
+      await ctx.blobs.put(key, bytes, {
+        contentType: args.signature.mimeType,
+      });
+      const signedAt = new Date();
+      await db
+        .update(schema.liabilityDocuments)
+        .set({ status: "signed", signatureBlobKey: key, signedAt })
+        .where(eq(schema.liabilityDocuments.id, doc.id));
+      await db.insert(schema.chatMessages).values({
+        caseId: args.caseId,
+        sender: "system",
+        text: "债务人已电子签署《有还款能力拒不还款责任书》。",
+      });
+      ctx.invalidateQueries();
+      return { ok: true as const, signedAt: signedAt.toISOString() };
+    },
+  }),
+
   getChatImage: defineAction({
     description: "取一条聊天消息附带图片的查看地址（需登录），没有图片时返回 null。",
     request: z.object({ messageId: z.number().int().positive() }),
@@ -4221,6 +4505,18 @@ const baseActions = {
       debtorName: z.string(),
       debtorAvatarUrl: z.string(),
       agentAvatarUrl: z.string(),
+      // 最新的一份责任书（待签署或已签署，无则 null）：债务人页据此弹出签署。
+      liabilityDocument: z
+        .object({
+          id: z.number(),
+          title: z.string(),
+          content: z.string(),
+          status: z.string(),
+          signatureUrl: z.string(),
+          signedAt: z.string().nullable(),
+          createdAt: z.string(),
+        })
+        .nullable(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
@@ -4273,6 +4569,27 @@ const baseActions = {
         debtorName: row.debtorName ?? "",
         debtorAvatarUrl,
         agentAvatarUrl,
+        liabilityDocument: await (async () => {
+          const docs = await db
+            .select()
+            .from(schema.liabilityDocuments)
+            .where(eq(schema.liabilityDocuments.caseId, row.id))
+            .orderBy(desc(schema.liabilityDocuments.id))
+            .limit(1);
+          const d = docs[0];
+          if (!d) return null;
+          return {
+            id: d.id,
+            title: d.title,
+            content: d.content,
+            status: d.status,
+            signatureUrl: d.signatureBlobKey
+              ? ((await ctx.blobs.getUrl(d.signatureBlobKey)) ?? "")
+              : "",
+            signedAt: d.signedAt ? d.signedAt.toISOString() : null,
+            createdAt: d.createdAt.toISOString(),
+          };
+        })(),
         messages: await Promise.all(
           messages.map(async (m) => ({
             id: m.id,
@@ -4378,6 +4695,16 @@ const baseActions = {
           .update(schema.chatMessages)
           .set({ imageBlobKey: key })
           .where(eq(schema.chatMessages.id, inserted.id));
+      }
+      // 拒付触发：债务人说“不还”就生成一份《有还款能力拒不还款责任书》
+      // 待签署（已有待签署的不重复生成）；生成失败不影响消息发送本身。
+      // 注意：“没钱/还不起”是困难表述，走分期/减免转专员，不触发。
+      if (LIABILITY_REFUSAL_RE.test(text)) {
+        try {
+          await createLiabilityDocument(ctx, row.id);
+        } catch {
+          /* 责任书生成失败不影响发消息，专员可在后台手动发送 */
+        }
       }
       // 新消息自动分析：与管理员手动「分析这句」同一口径，分析写回消息后
       // 该案还款意愿（computeWillingness 解析分析文本）随之更新。分析失败
@@ -6075,6 +6402,7 @@ const baseActions = {
         paidButtonText: z.string(),
       }),
       paidMessageTemplate: z.string(),
+      liabilityDocTemplate: z.string(),
     }),
     response: saveChatScriptsResponse,
     handler: async (
@@ -6130,6 +6458,7 @@ const baseActions = {
         ["付款卡说明", args.payCard.note],
         ["付款卡按钮文案", args.payCard.paidButtonText],
         ["付款成功消息模板", args.paidMessageTemplate],
+        ["责任书模板", args.liabilityDocTemplate],
       ];
       for (const [label, value] of textFields) {
         if (!value.trim()) throw new Error(`${label}不能为空。`);
@@ -6189,6 +6518,7 @@ const baseActions = {
         ["payCard.note", args.payCard.note],
         ["payCard.paidButtonText", args.payCard.paidButtonText],
         ["paidMessageTemplate", args.paidMessageTemplate],
+        ["liabilityDocTemplate", args.liabilityDocTemplate],
       ];
       for (const [key, value] of settingRows) {
         await db.insert(schema.chatScripts).values({
@@ -7095,6 +7425,7 @@ const PUBLIC_ACTIONS: ReadonlySet<string> = new Set([
   "generateReply",
   "uploadDebtorAvatar",
   "getChatScripts",
+  "signLiabilityDocument",
 ]);
 
 // 只读查看：管理员与任何操作员都能用（数据按分案范围在 handler 里过滤）
@@ -7106,6 +7437,7 @@ const READ_ACTIONS: ReadonlySet<string> = new Set([
   "getCase",
   "getChat",
   "getChatImage",
+  "getLiabilityDocument",
   "getPayments",
   "getPaymentScreenshot",
   "getHomepageContent",
@@ -7176,6 +7508,8 @@ const ACTION_PERMISSIONS: ReadonlyMap<string, PermissionKey> = new Map<
   ["addChatMessage", "chat"],
   ["deleteChatMessage", "chat"],
   ["setNeedsHuman", "chat"],
+  // 责任书：专员手动发送（与发聊天消息同权限）
+  ["sendLiabilityDocument", "chat"],
   // 分析：手动分析债务人的一句话
   ["analyzeChatMessage", "analysis"],
   // 协议：协商事项的增改删
