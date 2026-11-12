@@ -2274,6 +2274,7 @@ const operatorPerfOut = z.object({
   highUnfollowedCount: z.number(),
   delaySignalTotal: z.number(),
   delaySignalCaught: z.number(),
+  learnedScriptCount: z.number(),
   suggestions: z.array(z.string()),
 });
 
@@ -2290,6 +2291,7 @@ async function computeOperatorPerformance(
   const caseRows = await db.select().from(schema.cases);
   const payRows = await db.select().from(schema.payments);
   const agreementRows = await db.select().from(schema.agreements);
+  const learnedRows = await db.select().from(schema.learnedScripts);
   const chatRows = await db
     .select()
     .from(schema.chatMessages)
@@ -2342,11 +2344,19 @@ async function computeOperatorPerformance(
     highUnfollowedCount: number;
     delaySignalTotal: number;
     delaySignalCaught: number;
+    learnedScriptCount: number;
   };
   const raws: Raw[] = [];
   for (const op of ops) {
     const myCases = caseRows.filter((r) => r.assigneeId === op.id);
     const myCaseIds = new Set(myCases.map((r) => r.id));
+    /* 话术质量（用户 2026-11-12 定为第四项评估维度）：入选已学会话术数——
+       该操作员名下案件产出的、被学进话术库的条数。专员自己发的消息是即时
+       学进的，模型回话是收款后提进的；两者都按 sourceCaseId 归到案件的
+       负责人名下。有沟通却一条都没入选，说明表达没产出可复用的好话术。 */
+    const learnedScriptCount = learnedRows.filter((l) =>
+      myCaseIds.has(l.sourceCaseId),
+    ).length;
     const totalDueCents = myCases.reduce((s, r) => s + r.totalDueCents, 0);
     const repaidCents = myCases.reduce(
       (s, r) => s + (matchedByCase.get(r.id) ?? 0),
@@ -2442,6 +2452,7 @@ async function computeOperatorPerformance(
       highUnfollowedCount,
       delaySignalTotal,
       delaySignalCaught,
+      learnedScriptCount,
     });
   }
 
@@ -2458,6 +2469,15 @@ async function computeOperatorPerformance(
       suggestions.push("暂无负责案件，暂无评估数据。");
     } else if (r.debtorMessageCount === 0 && r.agentMessageCount === 0) {
       suggestions.push("名下有案件但暂无沟通记录，建议主动联系债务人跟进。");
+    }
+    if (
+      r.caseCount > 0 &&
+      r.agentMessageCount > 0 &&
+      r.learnedScriptCount === 0
+    ) {
+      suggestions.push(
+        "有沟通但名下案件一条话术都没入选已学库，建议对照优质话术打磨表达，让每句话都值得被学进去。",
+      );
     }
     if (r.caseCount > 0 && r.recoveryRate < teamAvgRate) {
       suggestions.push(
@@ -2500,6 +2520,7 @@ async function computeOperatorPerformance(
       highUnfollowedCount: r.highUnfollowedCount,
       delaySignalTotal: r.delaySignalTotal,
       delaySignalCaught: r.delaySignalCaught,
+      learnedScriptCount: r.learnedScriptCount,
       suggestions,
     };
   });
@@ -7224,7 +7245,7 @@ const baseActions = {
 
   getOperatorPerformance: defineAction({
     description:
-      "操作员回款能力分析（大数据统计页版块）：每个操作员一行——负责案件数、总欠款、已回款、回款率、平均回款天数（建档到第一笔确认回款）、高意愿未回款数；沟通信号来自其名下案件的聊天记录：债务人消息数、我方回复数、平均回复时长（小时）、高意愿未跟进数（高意愿且未结清、最后一条债务人消息后还没有我方回复的案件）、拖延信号总次数与抓到（其后有我方回复跟进）次数；建议由服务端按规则生成（回款率低于团队平均、高意愿未跟进、拖延信号没抓到、回复不及时；0 案件或 0 沟通时不评好坏，只说暂无数据。无问题时为表现稳定）。管理员与分案主管看全部操作员，普通操作员只返回自己一行。",
+      "操作员回款能力分析（大数据统计页版块）：每个操作员一行——负责案件数、总欠款、已回款、回款率、平均回款天数（建档到第一笔确认回款）、高意愿未回款数；沟通信号来自其名下案件的聊天记录：债务人消息数、我方回复数、平均回复时长（小时）、高意愿未跟进数（高意愿且未结清、最后一条债务人消息后还没有我方回复的案件）、拖延信号总次数与抓到（其后有我方回复跟进）次数；建议由服务端按规则生成（回款率低于团队平均、高意愿未跟进、拖延信号没抓到、回复不及时、话术质量即入选已学会话术数；0 案件或 0 沟通时不评好坏，只说暂无数据。无问题时为表现稳定）。管理员与分案主管看全部操作员，普通操作员只返回自己一行。",
     request: z.object({}),
     response: z.object({ rows: z.array(operatorPerfOut) }),
     async handler(ctx) {
