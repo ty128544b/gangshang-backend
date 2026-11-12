@@ -359,7 +359,7 @@ const GENERATE_REPLY_SYSTEM_TEMPLATE = `你是一位经验丰富的催收专员�
 3. 语气坚定但不生硬，有商有量。不要用“您好”“请问”“麻烦您”这类客套话。关键处点一下截止时间或后果就行，不用每句都挂着。
 4. 只给选择题，不问是非题。不要问“能还吗”“付清吗”“确认吗”，要问“今天先付 ¥{lockAmount} 锁定，还是直接按 ¥{amount} 结清？”
 5. 对方说“下个月”“考虑一下”“没钱”，必须追具体日期 + 今天先付 ¥{lockAmount} 锁定。
-6. 你看不到图片，也查不到银行流水，永远不要说“到账了”“已核销”“已收到款”“已确认到账”。对方说已付款、发了截图或问“收到了？”时，只回“截图已收到，已转专员核对，银行到账后专员会回复您确认”；欠款仍按全额 ¥{amount} 算，绝不能按对方说的数减。
+6. 你看不到图片，也查不到银行流水，永远不要说“到账了”“已核销”“已收到款”“已确认到账”。对方说已付款、发了截图或问“收到了？”时，只回“请稍等，财务核验中，请稍等”；欠款仍按全额 ¥{amount} 算，绝不能按对方说的数减。
 7. 对方说还不起/只能还一点，必须给分期选择（6 期每月 ¥{install6}，或 12 期每月 ¥{install12}），不能只让今天付清全额。
 8. 对方前后矛盾当场点破。
 9. 对方一旦答应金额 + 时间，立刻逐字复述请对方回“确认”。
@@ -4496,8 +4496,10 @@ const baseActions = {
       // 截图也敢说“到账了，400 元已核销”。
       const PAYMENT_CLAIM_RE =
         /查收|截图|已付|付了|付完|我付|支付了|转了|转过去|打过去|汇过去|已转|已付款|付款了|收到了|收到没|到账了吗|到账了没|到账没|到账了/;
-      // 近 3 条里有图才算凭证到了：覆盖“发图后追问收到了？”的情况；
-      // 光说付了、没发图，就让对方先传截图，别谎称“截图已收到”。
+      // 近 3 条里有图只决定回话的措辞，不单独触发：触发条件只有两个——
+      // 本条就是带图消息，或本条文字在说付款/追问到账。否则发图后债务人
+      // 再说别的（比如“我没钱”），也会被错当成付款消息回“截图已收到”。
+      let latestHasImage = false;
       let hasRecentImage = false;
       try {
         const recentDebtor = await db
@@ -4511,11 +4513,13 @@ const baseActions = {
           )
           .orderBy(desc(schema.chatMessages.id))
           .limit(3);
+        latestHasImage = recentDebtor[0]?.imageBlobKey != null;
         hasRecentImage = recentDebtor.some((m) => m.imageBlobKey != null);
       } catch {
+        latestHasImage = false;
         hasRecentImage = false;
       }
-      if (hasRecentImage || PAYMENT_CLAIM_RE.test(args.text)) {
+      if (latestHasImage || PAYMENT_CLAIM_RE.test(args.text)) {
         try {
           await db
             .update(schema.cases)
@@ -4526,7 +4530,7 @@ const baseActions = {
         }
         if (hasRecentImage) {
           return {
-            reply: "截图已收到，已转专员核对，银行到账后专员会回复您确认。",
+            reply: "请稍等，财务核验中，请稍等。",
             modelAvailable: true,
           };
         }
