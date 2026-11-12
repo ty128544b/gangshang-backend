@@ -308,6 +308,120 @@ const DEFAULT_MODEL_ENDPOINT_URL = "https://api.groq.com/openai";
 // 未配时 generateReply 返回 modelAvailable:false，债务人页回落关键词。
 const GROQ_API_KEY = (process.env.GROQ_API_KEY ?? "").trim();
 
+/* ---------------- 付款凭证 AI 初核（视觉模型） ----------------
+   Groq 免费 key 没有视觉模型，纯文本模型看不到图——2026-11-12 实测它
+   对着一张导航栏截图也敢说“到账了，400 元已核销”。凭证核实分两段：
+   AI 先看图给初核结论（是不是付款截图、图里金额/收款方/备注案件编号），
+   专员再拿银行流水做最终确认；AI 的结论只给专员看，永远不对债务人
+   说“到账/已核销”。视觉模型走 Cloudflare Workers AI 免费层
+   （llama-3.2-11b-vision-instruct），配置走环境变量 CF_ACCOUNT_ID /
+   CF_AI_TOKEN（FadeHost 面板设置），未配或调用失败时返回 null（未知），
+   不阻塞主流程。 */
+const CF_ACCOUNT_ID = (process.env.CF_ACCOUNT_ID ?? "").trim();
+const CF_AI_TOKEN = (process.env.CF_AI_TOKEN ?? "").trim();
+const CF_VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
+
+type ScreenshotVerdict = {
+  isPaymentScreenshot: boolean;
+  amountYuan: number | null;
+  payee: string | null;
+  caseNoSeen: boolean;
+  notes: string;
+};
+
+// 初核结论写进消息 analysis / 待确认回款展示的固定格式（一行），
+// generateReply 靠它判断回什么话，专员在后台直接读同一行。
+function formatVerdictLine(v: ScreenshotVerdict): string {
+  const amount =
+    v.amountYuan != null ? `金额¥${v.amountYuan}` : "金额未看清";
+  const payee = v.payee ? `收款方：${v.payee}` : "收款方未看清";
+  const caseNo = v.caseNoSeen ? "备注含案件编号" : "备注未见案件编号";
+  return `【凭证AI初核】${v.isPaymentScreenshot ? "是付款截图" : "不是付款截图"}|${amount}|${payee}|${caseNo}|${v.notes}`;
+}
+
+function parseVerdictLine(analysis: string): ScreenshotVerdict | null {
+  const m = analysis.match(/【凭证AI初核】([^\n]*)/);
+  if (!m) return null;
+  const seg = m[1];
+  // “未完成”行里没有“付款截图”四个字，说明初核没跑出结论，返回 null。
+  if (!seg.includes("付款截图")) return null;
+  // 注意：“不是付款截图”里也含“是付款截图”子串，必须先排除“不是”。
+  const isPay = seg.includes("是付款截图") && !seg.includes("不是付款截图");
+  const amountMatch = seg.match(/金额¥([\d,]+(?:\.\d+)?)/);
+  const payeeMatch = seg.match(/收款方：([^|]*)/);
+  return {
+    isPaymentScreenshot: isPay,
+    amountYuan: amountMatch
+      ? Number(amountMatch[1].replace(/,/g, ""))
+      : null,
+    payee:
+      payeeMatch && payeeMatch[1] && payeeMatch[1] !== "未看清"
+        ? payeeMatch[1]
+        : null,
+    caseNoSeen: seg.includes("备注含案件编号"),
+    notes: seg.split("|")[4] ?? "",
+  };
+}
+
+async function verifyPaymentScreenshot(
+  imageBytes: Buffer,
+  caseRow: { caseNo: string; totalDueCents: number },
+  claimedAmountCents?: number,
+): Promise<ScreenshotVerdict | null> {
+  if (!CF_ACCOUNT_ID || !CF_AI_TOKEN) return null;
+  const prompt = `你正在核对一张债务人发来的付款凭证截图。案件编号 ${caseRow.caseNo}，本案应还总额 ¥${(caseRow.totalDueCents / 100).toFixed(2)}${claimedAmountCents ? `，债务人称本次付了 ¥${(claimedAmountCents / 100).toFixed(2)}` : ""}。只看这张图，用 JSON 回答，不要加任何其他文字：{"isPaymentScreenshot": true/false（图是不是微信/支付宝/银行付款或转账成功的截图）,"amountYuan": 图里显示的付款金额数字，没有则 null,"payee": 图里显示的收款方名称，没有则 null,"caseNoSeen": 备注/附言里有没有出现案件编号 ${caseRow.caseNo}，true/false,"notes": 一句话说明判断依据}`;
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_VISION_MODEL}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${CF_AI_TOKEN}`,
+        },
+        body: JSON.stringify({
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: `data:image/jpeg;base64,${imageBytes.toString("base64")}`,
+                  },
+                },
+              ],
+            },
+          ],
+          max_tokens: 300,
+        }),
+        signal: AbortSignal.timeout(20000),
+      },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as { result?: { response?: unknown } };
+    const text = data?.result?.response;
+    if (typeof text !== "string") return null;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]) as Partial<ScreenshotVerdict>;
+    return {
+      isPaymentScreenshot: parsed.isPaymentScreenshot === true,
+      amountYuan:
+        typeof parsed.amountYuan === "number" ? parsed.amountYuan : null,
+      payee:
+        typeof parsed.payee === "string" && parsed.payee
+          ? parsed.payee
+          : null,
+      caseNoSeen: parsed.caseNoSeen === true,
+      notes: typeof parsed.notes === "string" ? parsed.notes : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function loadModelEndpointUrl(ctx: Ctx): Promise<string> {
   const db = ctx.db<typeof schema>();
   const rows = await db.select().from(schema.systemSettings);
@@ -1969,19 +2083,22 @@ const pendingPaymentItemOut = z.object({
   createdAt: z.string(),
   hasScreenshot: z.boolean(),
   screenshotUrl: z.string(),
+  // 凭证 AI 初核结论（JSON 字符串，空串 = 未初核/初核失败），专员对账前先看它。
+  aiVerdict: z.string(),
 });
 
 /* 协商分析：对一条债务人发言调模型给出意图 / 还款意愿 / 风险点 / 建议
    话术，结果按固定格式存回该消息的 analysis，还款意愿由
    computeWillingness 从分析文本里解析。analyzeChatMessage（管理员手动
    点「分析这句」）与 sendDebtorMessage（新消息到达自动分析）共用这一个
-   口径。无文字内容（纯图片消息）不分析、返回 null；模型失败时抛错，
+   口径。纯图片消息无文字可分析时只做凭证 AI 初核（视觉模型看图），
+   初核结论以【凭证AI初核】行写进 analysis 开头；模型失败时抛错，
    由调用方决定是报错还是静默跳过。 */
 async function runDebtorMessageAnalysis(
   ctx: Ctx,
-  msg: { id: number; caseId: number; text: string },
+  msg: { id: number; caseId: number; text: string; imageBytes?: Buffer | null },
 ): Promise<string | null> {
-  if (!msg.text.trim()) return null;
+  if (!msg.text.trim() && !msg.imageBytes) return null;
   const db = ctx.db<typeof schema>();
   const caseRows = await db
     .select()
@@ -1989,6 +2106,29 @@ async function runDebtorMessageAnalysis(
     .where(eq(schema.cases.id, msg.caseId))
     .limit(1);
   const c = caseRows[0];
+  // 带图消息：AI 先看图初核凭证（是不是付款截图、金额/收款方/备注
+  // 案件编号），结论写进 analysis 开头给专员看；初核失败则留一行
+  // “未完成”提示，专员人工看图。纯图消息也走这里。
+  let verdictLine = "";
+  if (msg.imageBytes && c) {
+    try {
+      const verdict = await verifyPaymentScreenshot(msg.imageBytes, c);
+      verdictLine = verdict
+        ? formatVerdictLine(verdict)
+        : "【凭证AI初核】未完成（视觉服务不可用），请专员人工看图。";
+    } catch {
+      verdictLine =
+        "【凭证AI初核】未完成（视觉服务不可用），请专员人工看图。";
+    }
+  }
+  if (!msg.text.trim()) {
+    const analysis = verdictLine;
+    await db
+      .update(schema.chatMessages)
+      .set({ analysis })
+      .where(eq(schema.chatMessages.id, msg.id));
+    return analysis;
+  }
   const history = await db
     .select()
     .from(schema.chatMessages)
@@ -2023,12 +2163,15 @@ async function runDebtorMessageAnalysis(
       .join("\n"),
     { schema: analysisSchema },
   );
-  const analysis = [
+  const textAnalysis = [
     `意图：${result.intent}`,
     `还款意愿：${result.willingness}`,
     `风险点：${result.risk}`,
     `建议话术：${result.suggestion}`,
   ].join("\n");
+  const analysis = verdictLine
+    ? `${verdictLine}\n${textAnalysis}`
+    : textAnalysis;
   await db
     .update(schema.chatMessages)
     .set({ analysis })
@@ -2650,6 +2793,7 @@ const baseActions = {
           screenshotUrl: p.screenshotBlobKey
             ? ((await ctx.blobs.getUrl(p.screenshotBlobKey)) ?? "")
             : "",
+          aiVerdict: (p as { aiVerdict?: string }).aiVerdict ?? "",
         });
       }
       return { items };
@@ -4381,15 +4525,16 @@ const baseActions = {
       // 新消息自动分析：与管理员手动「分析这句」同一口径，分析写回消息后
       // 该案还款意愿（computeWillingness 解析分析文本）随之更新。分析失败
       // 不影响消息发送本身，analysis 留空，管理员仍可在面板手动补分析。
-      // 纯图消息无文字可分析，直接跳过。
+      // 带图消息一并做凭证 AI 初核（视觉模型看图，结论写进 analysis 开头）。
       let analysis = "";
       try {
         analysis =
-          text.trim()
+          text.trim() || (args.image && imageBytes)
             ? (await runDebtorMessageAnalysis(ctx, {
                 id: inserted.id,
                 caseId: row.id,
                 text,
+                imageBytes: args.image && imageBytes ? imageBytes : null,
               })) ?? ""
             : "";
       } catch {
@@ -4488,17 +4633,24 @@ const baseActions = {
       if (row.humanTakeoverAt != null) {
         return { reply: null, modelAvailable: false };
       }
-      // 付款核销防线：模型是纯文本，看不到图片、查不到银行流水，绝不能让它
-      // 自行确认到账。债务人最新一条消息带图片，或本条文字声称已付款/发了
-      // 截图/问是否收到，一律不调模型，直接回固定转接话术，并把案件标为
-      // 待人工处理（needsHuman），等专员在后台对账确认。否则模型会像 2026-11-12
-      // 实测那样，对着一张非付款截图也敢说“到账了，400 元已核销”。
+      // 付款凭证两段核实：AI 先看图初核（视觉模型结论存在带图那条债务人
+      // 消息的 analysis 里，【凭证AI初核】行），专员再拿银行流水最终确认。
+      // 纯文本模型看不到图片、查不到银行流水，绝不能让它自行确认到账——
+      // 2026-11-12 实测它对着一张导航栏截图也敢说“到账了，400 元已核销”。
+      // 因此带图或声称已付款的消息一律不调文本模型：AI 初核说不是付款
+      // 截图就让债务人重传；是付款截图或初核未知就只回“正在核对”，等专员
+      // 确认；无图光说付了就让对方先传截图。三种回法都不提“到账/已核销”。
       const PAYMENT_CLAIM_RE =
         /查收|截图|已付|付了|付完|我付|支付了|转了|转过去|打过去|汇过去|已转|已付款|付款了|收到了|收到没|到账了吗|到账了没|到账没|到账了/;
-      let latestHasImage = false;
+      // 最新一条债务人消息带图 → 按该图的初核结论回；最新一条无图但本条
+      // 文字在追问付款（“收到了？”）→ 往前找最近一张图按同样口径回。
+      let imageAnalysis = "";
       try {
-        const latestDebtor = await db
-          .select({ imageBlobKey: schema.chatMessages.imageBlobKey })
+        const recentDebtor = await db
+          .select({
+            imageBlobKey: schema.chatMessages.imageBlobKey,
+            analysis: schema.chatMessages.analysis,
+          })
           .from(schema.chatMessages)
           .where(
             and(
@@ -4507,12 +4659,19 @@ const baseActions = {
             ),
           )
           .orderBy(desc(schema.chatMessages.id))
-          .limit(1);
-        latestHasImage = (latestDebtor[0]?.imageBlobKey ?? null) != null;
+          .limit(3);
+        if (recentDebtor[0]?.imageBlobKey != null) {
+          imageAnalysis = recentDebtor[0].analysis ?? "";
+        } else if (PAYMENT_CLAIM_RE.test(args.text)) {
+          const withImage = recentDebtor.find((m) => m.imageBlobKey != null);
+          if (withImage) imageAnalysis = withImage.analysis ?? "";
+        }
       } catch {
-        latestHasImage = false;
+        imageAnalysis = "";
       }
-      if (latestHasImage || PAYMENT_CLAIM_RE.test(args.text)) {
+      const paymentClaimed =
+        imageAnalysis !== "" || PAYMENT_CLAIM_RE.test(args.text);
+      if (paymentClaimed) {
         try {
           await db
             .update(schema.cases)
@@ -4521,8 +4680,22 @@ const baseActions = {
         } catch {
           // 忽略
         }
+        if (imageAnalysis !== "") {
+          const verdict = parseVerdictLine(imageAnalysis);
+          if (verdict && !verdict.isPaymentScreenshot) {
+            return {
+              reply:
+                "这张图看起来不是付款截图，请重新上传付款成功的截图，专员核对后会回复您。",
+              modelAvailable: true,
+            };
+          }
+          return {
+            reply: "截图已收到，正在核对，专员核实银行流水后回复您确认。",
+            modelAvailable: true,
+          };
+        }
         return {
-          reply: "截图已收到，已转专员核对，银行到账后专员会回复您确认。",
+          reply: "请上传付款截图，专员核对银行流水后会回复您确认。",
           modelAvailable: true,
         };
       }
@@ -4983,6 +5156,24 @@ const baseActions = {
         .update(schema.payments)
         .set({ screenshotBlobKey: key })
         .where(eq(schema.payments.id, inserted.id));
+      // AI 初核凭证：视觉模型先看图（是不是付款截图、金额/收款方/
+      // 备注案件编号），结论存 ai_verdict 供专员在待确认回款里看；
+      // AI 只初核，最终确认仍由专员拿银行流水做。初核失败不阻塞提交。
+      try {
+        const verdict = await verifyPaymentScreenshot(
+          bytes,
+          row,
+          args.amountCents,
+        );
+        if (verdict) {
+          await db
+            .update(schema.payments)
+            .set({ aiVerdict: JSON.stringify(verdict) })
+            .where(eq(schema.payments.id, inserted.id));
+        }
+      } catch {
+        // 忽略
+      }
       ctx.invalidateQueries();
       return { id: inserted.id };
     },
