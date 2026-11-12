@@ -1089,6 +1089,20 @@ async function loadChatScripts(ctx: Ctx): Promise<ChatScriptsData> {
   if (rows.length === 0) {
     const d = cloneDefaultChatScripts();
     d.confirmedTechniques = confirmedTechniques;
+    /* 表空时走内置默认话术，默认值里写死的是旧系统名，同样要换成当前名
+       （与下面有行时的返回口径一致）。 */
+    const sysNameEmpty = await loadSystemName(ctx);
+    if (sysNameEmpty && sysNameEmpty !== DEFAULT_SYSTEM_NAME) {
+      d.chatSubtitle = d.chatSubtitle
+        .split(DEFAULT_SYSTEM_NAME)
+        .join(sysNameEmpty);
+      d.opening = d.opening.map((line) =>
+        line.split(DEFAULT_SYSTEM_NAME).join(sysNameEmpty),
+      );
+      d.liabilityDocTemplate = d.liabilityDocTemplate
+        .split(DEFAULT_SYSTEM_NAME)
+        .join(sysNameEmpty);
+    }
     return d;
   }
   const defaults = cloneDefaultChatScripts();
@@ -1104,7 +1118,17 @@ async function loadChatScripts(ctx: Ctx): Promise<ChatScriptsData> {
   );
   const setting = (key: string, fallbackValue: string): string =>
     settingMap.get(key) ?? fallbackValue;
-  return {
+  /* 话术里的系统名跟随当前 systemName：默认值与旧保存里写死的是
+     “港上资产执行系统”，改名后只改 systemName 的话，聊天副标题、开场白、
+     责任书模板还会吐旧名（2026-11-12 用户截图）。这里返回前统一把
+     DEFAULT_SYSTEM_NAME 换成库里当前名；债务人页另有 syncChatSystemName
+     兜底，两边都守。 */
+  const sysName = await loadSystemName(ctx);
+  const subName = (v: string): string =>
+    sysName && sysName !== DEFAULT_SYSTEM_NAME
+      ? v.split(DEFAULT_SYSTEM_NAME).join(sysName)
+      : v;
+  const result: ChatScriptsData = {
     rules:
       ruleRows.length > 0
         ? ruleRows.map((r, i) => ({
@@ -1152,6 +1176,10 @@ async function loadChatScripts(ctx: Ctx): Promise<ChatScriptsData> {
     ),
     confirmedTechniques,
   };
+  result.chatSubtitle = subName(result.chatSubtitle);
+  result.opening = result.opening.map((line) => subName(line));
+  result.liabilityDocTemplate = subName(result.liabilityDocTemplate);
+  return result;
 }
 
 async function loadHomepageExtras(ctx: Ctx) {
@@ -6305,6 +6333,7 @@ const baseActions = {
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.systemSettings);
       const row = rows[0];
+      const oldName = (row?.systemName || "").trim();
       if (row) {
         await db
           .update(schema.systemSettings)
@@ -6314,6 +6343,38 @@ const baseActions = {
         await db
           .insert(schema.systemSettings)
           .values({ systemName: args.systemName });
+      }
+      /* 改名要同步改话术设置里存的旧名：聊天副标题（chatSubtitle）与开场白
+         （opening 两行）里都写死了系统名，只改 systemName 的话，债务人进聊天
+         还是看到旧名（2026-11-12 用户截图）。副标题直接按新名重建；开场白里
+         的旧名取自当前副标题“旧名 · 在线”的旧名部分（话术设置里存的可能比
+         systemSettings 更旧），换成新名。债务人页另有 syncChatSystemName
+         兜底（加载时再换一次），两边都守。 */
+      if (oldName && oldName !== args.systemName) {
+        const scriptRows = await db.select().from(schema.chatScripts);
+        const subRow = scriptRows.find(
+          (r) => r.kind === "setting" && r.ruleKey === "chatSubtitle",
+        );
+        const subReply = subRow?.reply || "";
+        const sepIdx = subReply.indexOf(" · ");
+        const nameInScripts =
+          sepIdx > 0 ? subReply.slice(0, sepIdx).trim() : "";
+        const nameToReplace = nameInScripts || oldName;
+        if (subRow) {
+          await db
+            .update(schema.chatScripts)
+            .set({ reply: `${args.systemName} · 在线` })
+            .where(eq(schema.chatScripts.id, subRow.id));
+        }
+        for (const r of scriptRows) {
+          if (r.kind !== "opening") continue;
+          const reply = r.reply || "";
+          if (!nameToReplace || !reply.includes(nameToReplace)) continue;
+          await db
+            .update(schema.chatScripts)
+            .set({ reply: reply.split(nameToReplace).join(args.systemName) })
+            .where(eq(schema.chatScripts.id, r.id));
+        }
       }
       ctx.invalidateQueries();
       return { ok: true, systemName: args.systemName };

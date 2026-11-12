@@ -5,3 +5,10 @@
 2026-11-11 14:01:01 backup-20261111-1400.db 184320 HTTP 200
 2026-11-11 20:01:20 backup-20261111-2000.db 184320 HTTP 200
 2026-11-12 10:00:47 backup-20261112-1000.db 184320 HTTP 200
+2026-11-12 13:07 predeploy backup backup-20261112-1307-predeploy.db
+2026-11-12 05:16 postdeploy backup backup-20261112-0516-postdeploy-d086164.db (d086164 live)
+2026-11-12 13:28 predeploy backup backup-20261112-1328-predeploy-82a7aef.db (82a7aef)
+2026-11-12 13:29 postdeploy backup backup-20261112-1329-postdeploy-82a7aef.db (82a7aef live)
+2026-11-12 13:53 predeploy backup backup-20261112-1353-predeploy-3af155e.db (3af155e)
+2026-11-12 13:55 postdeploy backup backup-20261112-1355-postdeploy-3af155e.db (3af155e live)
+2026-11-12 16:00 backup-20261112-1600.db 266240 HTTP 200
