@@ -1,0 +1,1 @@
+ALTER TABLE cases ADD COLUMN monthly_income_cents INTEGER NOT NULL DEFAULT 0;

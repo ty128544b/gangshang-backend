@@ -44,6 +44,7 @@ const caseOut = z.object({
   transferAgreementNo: z.string(),
   note: z.string(),
   entryPoint: z.string(),
+  monthlyIncomeCents: z.number(),
   needsHuman: z.boolean(),
   humanNote: z.string(),
   humanTakeover: z.boolean(),
@@ -374,6 +375,7 @@ const GENERATE_REPLY_SYSTEM_TEMPLATE = `你是一位经验丰富的催收专员�
 11. 对方说“人工”“转人工”“找真人”“换个人”“让你们领导来”，只回“好的，已为您转接专员，请稍等”，不要再推付款。
 12. 先接对方这句话（他说什么你先回什么），再提付款。不要上来就推付款。
 13. 拒不还款责任书：对方说不还、拒绝还款时，系统会在这个聊天里弹出《有还款能力拒不还款责任书》，对方在页面上手写签名即可。对方问在哪里签时，只说“责任书已经在聊天里弹出来了，点开就能签”，绝不要说发微信、发短信、发邮件、邮寄。
+14. 信息追问：对方透露收入、工作、家庭、资产等信息但不完整时，必须先追问补全再谈还款。比如对方说“一个月才 3000 块钱”，必须问“做什么工作？”；对方说“在公司上班”，必须问“在公司做什么？一个月收入多少？”追问要自然，套在还款话题里（“我帮您算算一个月能还多少”），不要像查户口。一次只问一个信息，不要连珠炮。
 
 【标准示范由后台话术设置（chat_scripts 表）提供，见下文“后台话术”一节，与关键词规则同一套，不另写。】`;
 
@@ -463,9 +465,22 @@ function buildGenerateReplySystem(
     const profileLines: string[] = [];
     const ageStr = profile.age != null ? `约 ${profile.age} 岁` : "年龄未知";
     const genderStr = profile.gender ? `（${profile.gender}）` : "";
+    const incomeYuan = (Number(row.monthlyIncomeCents) || 0) / 100;
     profileLines.push(
-      `年龄：${ageStr}${genderStr}；欠款 ${yuanForPrompt(row.totalDueCents)}（${profile.debtTier}），逾期 ${Number(row.overdueDays) || 0} 天。`,
+      `年龄：${ageStr}${genderStr}；欠款 ${yuanForPrompt(row.totalDueCents)}（${profile.debtTier}），逾期 ${Number(row.overdueDays) || 0} 天；月收入：${incomeYuan > 0 ? `¥${incomeYuan.toLocaleString("zh-CN")}` : "未知"}。`,
     );
+    const leverage = analyzeLeverage(row);
+    if (leverage) profileLines.push(`弱点/杠杆：${leverage}`);
+    // 待补信息：画像里还缺的关键项，直接点出来让模型先问，别急着谈还款。
+    const missing: string[] = [];
+    const occNow = (row.occupation ?? "").trim();
+    const vagueOcc = ["公司", "单位", "厂里", "厂", "企业", "上班", "工作", "打工"];
+    if (!occNow) missing.push("具体做什么工作");
+    else if (vagueOcc.includes(occNow))
+      missing.push(`具体做什么工作（只知在${occNow}上班）`);
+    if ((Number(row.monthlyIncomeCents) || 0) <= 0) missing.push("月收入多少");
+    if (missing.length > 0)
+      profileLines.push(`待补信息：${missing.join("、")}——先问这个，再谈还款。`);
     profileLines.push(
       `心理类型：${profile.archetype || "未定型"}；案件阶段：${profile.stage}。`,
     );
@@ -789,6 +804,102 @@ function assessEntryPoint(args: {
     .filter(Boolean)
     .join("；");
   if (bg) parts.push(`背景参考：${bg}`);
+  return parts.join("；");
+}
+
+/* ---------------- 沟通中实时抽取画像信息（2026-11-12，用户令“时时获取”）
+   债务人一句话里常带着画像信息（“在公司上班才 3000 块钱”），要当场
+   抽出来写回案件，再按新画像找弱点、定切入。抽取只认带语境的数字，
+   不把欠款数额错当收入。 */
+export interface ExtractedProfile {
+  monthlyIncomeCents?: number;
+  occupation?: string;
+  backgroundNote?: string;
+}
+
+function extractProfileFromText(text: string): ExtractedProfile {
+  const out: ExtractedProfile = {};
+  const t = (text ?? "").trim();
+  if (!t) return out;
+  // 月收入：月薪/工资/收入/一个月/才 + 数字（块/元/千）。“3千”按 3000 计。
+  const incomeRes = [
+    /(?:月薪|工资|收入|一个月|才)\s*[¥￥]?\s*(\d[\d,]*)\s*(千|k|K)?\s*(?:块|元)?/,
+    /(\d[\d,]*)\s*(千|k|K)\s*(?:块|元)?\s*(?:一个月|月薪|工资)?/,
+  ];
+  for (const re of incomeRes) {
+    const m = re.exec(t);
+    if (m) {
+      let yuan = Number((m[1] ?? "").replace(/,/g, ""));
+      if (!Number.isFinite(yuan) || yuan <= 0) continue;
+      if (m[2]) yuan *= 1000;
+      // 只认合理月收入（500–200000 元），欠款数额与天数不在此列。
+      if (yuan >= 500 && yuan <= 200000) {
+        out.monthlyIncomeCents = Math.round(yuan * 100);
+        break;
+      }
+    }
+  }
+  // 工作：跑网约车/滴滴/外卖/快递、在…上班、我是…、做…工作。
+  const jobRes = [
+    /跑\s*(网约车|滴滴|外卖|快递|货拉拉|出租车?)/,
+    // 捕获里不许含标点：否则“现在没钱，在公司上班”会从“现在”的“在”起
+    // 抓出“没钱，在公司”这种脏数据。
+    /在\s*([^，。,、]{1,10}?)\s*(上班|工作|打工)/,
+    /我是\s*([^，。,、]{1,10}?)\s*(工人|司机|厨师|保安|保洁|服务员|销售|农民|教师|医生|护士|快递员|外卖员|建筑工|装修工|个体户|老板|自由职业|职员|员工)/,
+    /做\s*([^，。,、]{1,10}?)\s*(工作|生意|餐饮|装修|销售|快递|外卖)/,
+    // 开网约车/滴滴/出租车、送外卖/快递：常见的零工说法。
+    /开\s*(网约车|滴滴|出租车|货车|卡车|货拉拉)/,
+    /送\s*(外卖|快递)/,
+  ];
+  for (const re of jobRes) {
+    const m = re.exec(t);
+    if (m) {
+      let job = (m[1] ?? "").trim().replace(/[，。,、\s]+$/g, "");
+      if (job.length >= 1 && job.length <= 12) {
+        // 开网约车/滴滴/出租车/货车 -> 网约车司机；送外卖/快递 -> 外卖员/快递员。
+        if (/^(网约车|滴滴|出租车|货车|卡车|货拉拉)$/.test(job)) job = `${job}司机`;
+        else if (/^(外卖)$/.test(job)) job = "外卖员";
+        else if (/^(快递)$/.test(job)) job = "快递员";
+        out.occupation = job;
+        break;
+      }
+    }
+  }
+  // 家庭/资产线索：有房有车、孩子上学、已婚，记进背景备注。
+  const notes: string[] = [];
+  if (/有\s*(房|房子)/.test(t)) notes.push("有房");
+  if (/有\s*(车|车子)/.test(t)) notes.push("有车");
+  if (/孩子.*(上学|读书|幼儿园|上小学|上初中)/.test(t)) notes.push("有上学孩子");
+  if (/老婆|老公|媳妇|丈夫|妻子/.test(t)) notes.push("已婚");
+  if (notes.length > 0) out.backgroundNote = notes.join("；");
+  return out;
+}
+
+/** 按画像找弱点（切入点）：收入、工作、欠款、逾期四项拼出杠杆。 */
+function analyzeLeverage(
+  row: typeof schema.cases.$inferSelect,
+): string {
+  const incomeYuan = (Number(row.monthlyIncomeCents) || 0) / 100;
+  const totalYuan = (Number(row.totalDueCents) || 0) / 100;
+  const occ = (row.occupation ?? "").trim();
+  const parts: string[] = [];
+  if (incomeYuan > 0) {
+    const affordable = Math.round(incomeYuan * 0.3);
+    if (incomeYuan < 3000) {
+      parts.push(`月入仅 ¥${incomeYuan.toLocaleString("zh-CN")}，还款能力弱：推小额锁定金 + 长期分期，别逼一次结清`);
+    } else if (affordable >= totalYuan) {
+      parts.push(`月入 ¥${incomeYuan.toLocaleString("zh-CN")}，每月可还约 ¥${affordable.toLocaleString("zh-CN")}，可推一次结清或短期分期`);
+    } else {
+      parts.push(`月入 ¥${incomeYuan.toLocaleString("zh-CN")}，每月可还约 ¥${affordable.toLocaleString("zh-CN")}（收入三成），推分期`);
+    }
+    if (totalYuan > 0 && incomeYuan > 0) {
+      const months = Math.ceil(totalYuan / Math.max(1, affordable));
+      if (months >= 12) parts.push(`欠款是月入 ${Math.round(totalYuan / incomeYuan)} 倍，还清要约 ${months} 个月，还款周期长`);
+    }
+  } else {
+    parts.push("收入未知：先问清工作与月收入再定方案");
+  }
+  if (occ) parts.push(`有稳定工作（${occ}），有收入可执行，分期有保障`);
   return parts.join("；");
 }
 
@@ -2033,6 +2144,7 @@ function toCaseOut(
     transferAgreementNo: row.transferAgreementNo,
     note: row.note,
     entryPoint: row.entryPoint ?? "",
+    monthlyIncomeCents: row.monthlyIncomeCents ?? 0,
     needsHuman: row.needsHuman === 1,
     humanNote: row.humanNote,
     humanTakeover: row.humanTakeoverAt != null,
@@ -5415,6 +5527,47 @@ const baseActions = {
       // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
       // 已学成功话术一并拼进提示词当示范。
       // 后台话术与关键词规则同一套 chat_scripts 表：后台改完，AI 即用同一套。
+      // 实时抽取画像：债务人这句话里常带着收入/工作/家庭信息，先抽出来
+      // 写回案件，再按新画像算心理类型、阶段与弱点。
+      try {
+        const ext = extractProfileFromText(args.text ?? "");
+        const patch: Record<string, unknown> = {};
+        if (
+          ext.monthlyIncomeCents != null &&
+          ext.monthlyIncomeCents > 0 &&
+          (Number(row.monthlyIncomeCents) || 0) !== ext.monthlyIncomeCents
+        ) {
+          patch.monthlyIncomeCents = ext.monthlyIncomeCents;
+          (row as { monthlyIncomeCents: number }).monthlyIncomeCents =
+            ext.monthlyIncomeCents;
+        }
+        if (
+          ext.occupation &&
+          (row.occupation ?? "").trim() !== ext.occupation
+        ) {
+          patch.occupation = ext.occupation;
+          (row as { occupation: string }).occupation = ext.occupation;
+        }
+        if (ext.backgroundNote) {
+          const cur = (row.backgroundNote ?? "").trim();
+          const add = ext.backgroundNote
+            .split("；")
+            .filter((n) => n && !cur.includes(n));
+          if (add.length > 0) {
+            const merged = cur ? `${cur}；${add.join("；")}` : add.join("；");
+            patch.backgroundNote = merged;
+            (row as { backgroundNote: string }).backgroundNote = merged;
+          }
+        }
+        if (Object.keys(patch).length > 0) {
+          await db
+            .update(schema.cases)
+            .set(patch)
+            .where(eq(schema.cases.id, args.caseId));
+        }
+      } catch {
+        // 抽取失败不影响回话本身。
+      }
       // 心理画像：算出当前案件的阶段、债务人心理类型与语气，话术匹配
       // 与提示词都按画像来。
       const psych = await getCasePsychContext(ctx, row, args.text ?? "");

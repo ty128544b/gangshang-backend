@@ -22,6 +22,9 @@ export const cases = sqliteTable("cases", {
   // 导入时科学评估定下的切入点（2026-11-12 心理画像系统）：按年龄/性别/
   // 金额档/逾期天数/背景算出的首次接触角度，存下来给专员与 AI 共用。
   entryPoint: text("entry_point").notNull().default(""),
+  // 月收入（分）：沟通中从债务人话里抽取（如“一个月才 3000 块钱”），
+  // 用于算每月可还额与弱点分析；0 = 未知。
+  monthlyIncomeCents: integer("monthly_income_cents").notNull().default(0),
   needsHuman: integer("needs_human").notNull().default(0),
   humanNote: text("human_note").notNull().default(""),
   // 人工接管时间戳：null = 机器人值守（债务人页按话术自动回复），
