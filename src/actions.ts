@@ -359,7 +359,7 @@ const GENERATE_REPLY_SYSTEM_TEMPLATE = `你是一位经验丰富的催收专员�
 3. 语气坚定但不生硬，有商有量。不要用“您好”“请问”“麻烦您”这类客套话。关键处点一下截止时间或后果就行，不用每句都挂着。
 4. 只给选择题，不问是非题。不要问“能还吗”“付清吗”“确认吗”，要问“今天先付 ¥{lockAmount} 锁定，还是直接按 ¥{amount} 结清？”
 5. 对方说“下个月”“考虑一下”“没钱”，必须追具体日期 + 今天先付 ¥{lockAmount} 锁定。
-6. 对方声称已经还过钱，必须先让对方发付款截图核对，确认到账再算账；截图没到之前，欠款还是 ¥{amount}，绝不能直接按对方说的数减。
+6. 你看不到图片，也查不到银行流水，永远不要说“到账了”“已核销”“已收到款”“已确认到账”。对方说已付款、发了截图或问“收到了？”时，只回“截图已收到，已转专员核对，银行到账后专员会回复您确认”；欠款仍按全额 ¥{amount} 算，绝不能按对方说的数减。
 7. 对方说还不起/只能还一点，必须给分期选择（6 期每月 ¥{install6}，或 12 期每月 ¥{install12}），不能只让今天付清全额。
 8. 对方前后矛盾当场点破。
 9. 对方一旦答应金额 + 时间，立刻逐字复述请对方回“确认”。
@@ -4487,6 +4487,44 @@ const baseActions = {
       // 人工接管时不调模型，返回不可用，债务人页机器人本来就停答。
       if (row.humanTakeoverAt != null) {
         return { reply: null, modelAvailable: false };
+      }
+      // 付款核销防线：模型是纯文本，看不到图片、查不到银行流水，绝不能让它
+      // 自行确认到账。债务人最新一条消息带图片，或本条文字声称已付款/发了
+      // 截图/问是否收到，一律不调模型，直接回固定转接话术，并把案件标为
+      // 待人工处理（needsHuman），等专员在后台对账确认。否则模型会像 2026-11-12
+      // 实测那样，对着一张非付款截图也敢说“到账了，400 元已核销”。
+      const PAYMENT_CLAIM_RE =
+        /查收|截图|已付|付了|付完|我付|支付了|转了|转过去|打过去|汇过去|已转|已付款|付款了|收到了|收到没|到账了吗|到账了没|到账没|到账了/;
+      let latestHasImage = false;
+      try {
+        const latestDebtor = await db
+          .select({ imageBlobKey: schema.chatMessages.imageBlobKey })
+          .from(schema.chatMessages)
+          .where(
+            and(
+              eq(schema.chatMessages.caseId, args.caseId),
+              eq(schema.chatMessages.sender, "debtor"),
+            ),
+          )
+          .orderBy(desc(schema.chatMessages.id))
+          .limit(1);
+        latestHasImage = (latestDebtor[0]?.imageBlobKey ?? null) != null;
+      } catch {
+        latestHasImage = false;
+      }
+      if (latestHasImage || PAYMENT_CLAIM_RE.test(args.text)) {
+        try {
+          await db
+            .update(schema.cases)
+            .set({ needsHuman: 1 })
+            .where(eq(schema.cases.id, args.caseId));
+        } catch {
+          // 忽略
+        }
+        return {
+          reply: "截图已收到，已转专员核对，银行到账后专员会回复您确认。",
+          modelAvailable: true,
+        };
       }
       // 端点地址：库里配了用库里的，没配用代码默认值。
       const endpoint = (await loadModelEndpointUrl(ctx)).trim();
