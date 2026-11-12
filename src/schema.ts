@@ -114,10 +114,6 @@ export const payments = sqliteTable("payments", {
   // 「债务人自助提交」。
   recordedBy: text("recorded_by").notNull().default(""),
   screenshotBlobKey: text("screenshot_blob_key"),
-  // 凭证 AI 初核结论（JSON 字符串）：视觉模型先看图给的初步判断
-  // （是不是付款截图、图里金额/收款方/备注案件编号），专员在待确认
-  // 回款里看到它再拿银行流水做最终确认。空串 = 未初核/初核失败。
-  aiVerdict: text("ai_verdict").notNull().default(""),
   reconcileStatus: text("reconcile_status", {
     enum: ["pending", "matched", "mismatch"],
   })
