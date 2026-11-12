@@ -8,7 +8,9 @@ import {
 } from "./shim";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createClient } from "@libsql/client";
 import { and, asc, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/libsql";
 import * as schema from "./schema";
 
 const caseFields = {
@@ -4004,7 +4006,7 @@ const baseActions = {
   }),
 
   restoreSystemSnapshot: defineAction({
-    description: "一键还原：把整个系统（案件、聊天、还款、页面内容、话术、已学话术）还原到指定快照。还原前先自动备份当前系统，还原后服务重启生效。仅管理员可用。",
+    description: "一键还原：把整个系统（案件、聊天、还款、页面内容）还原到指定快照；话术（chat_scripts）与已学会话术（learned_scripts）保留当前版本，不随快照回退。还原前先自动备份当前系统，还原后服务重启生效。仅管理员可用。",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({ ok: z.boolean() }),
     async handler(ctx, args) {
@@ -4029,7 +4031,48 @@ const baseActions = {
       if (buf.length < 100 || buf.subarray(0, 6).toString() !== "SQLite") {
         throw new Error("HTTP500:快照文件损坏，无法还原");
       }
-      writeFileSync(join(dataDir, "gangshang.db.restored"), buf);
+      // 话术与已学会话术保留当前版本（用户 2026-11-12 定）：还原前先读出当前
+      // 两张表的全部行，还原文件写盘后，再把这两张表换成当前版本。其它表
+      // 全部按快照回退。合并失败时宁可中止还原，也不断话术。
+      const currentScripts = await db.select().from(schema.chatScripts);
+      const currentLearned = await db.select().from(schema.learnedScripts);
+      const restoredPath = join(dataDir, "gangshang.db.restored");
+      writeFileSync(restoredPath, buf);
+      const restoredClient = createClient({ url: `file:${restoredPath}` });
+      try {
+        const restoredDb = drizzle(restoredClient, { schema });
+        await restoredDb.delete(schema.chatScripts);
+        if (currentScripts.length > 0) {
+          await restoredDb.insert(schema.chatScripts).values(
+            currentScripts.map((r) => ({
+              id: r.id,
+              kind: r.kind,
+              ruleKey: r.ruleKey,
+              pattern: r.pattern,
+              analysis: r.analysis,
+              reply: r.reply,
+              sortOrder: r.sortOrder,
+            })),
+          );
+        }
+        await restoredDb.delete(schema.learnedScripts);
+        if (currentLearned.length > 0) {
+          await restoredDb.insert(schema.learnedScripts).values(
+            currentLearned.map((r) => ({
+              id: r.id,
+              text: r.text,
+              normalized: r.normalized,
+              trigger: r.trigger,
+              sourceCaseId: r.sourceCaseId,
+              useCount: r.useCount,
+              createdAt: r.createdAt,
+            })),
+          );
+        }
+        await restoredClient.execute("PRAGMA wal_checkpoint(TRUNCATE);");
+      } finally {
+        restoredClient.close();
+      }
       await logAudit(ctx, "restore_system", "system", snap.id, `一键还原到快照 ${snap.id}（${snap.label}）`);
       // 写盘后退出，启动时自动用还原文件替换当前库。
       setTimeout(() => process.exit(0), 500);
