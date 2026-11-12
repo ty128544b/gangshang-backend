@@ -204,6 +204,13 @@
    "when": 1794496898528,
    "tag": "0029_monthly_income",
    "breakpoints": true
+  },
+  {
+   "idx": 29,
+   "version": "6",
+   "when": 1794497615386,
+   "tag": "0030_weakness_tags",
+   "breakpoints": true
   }
  ]
 }

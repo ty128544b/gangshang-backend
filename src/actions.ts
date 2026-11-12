@@ -47,6 +47,7 @@ const caseOut = z.object({
   note: z.string(),
   entryPoint: z.string(),
   monthlyIncomeCents: z.number(),
+  weaknessTags: z.string(),
   needsHuman: z.boolean(),
   humanNote: z.string(),
   humanTakeover: z.boolean(),
@@ -378,6 +379,7 @@ const GENERATE_REPLY_SYSTEM_TEMPLATE = `你是一位经验丰富的催收专员�
 12. 先接对方这句话（他说什么你先回什么），再提付款。不要上来就推付款。
 13. 拒不还款责任书：对方说不还、拒绝还款时，系统会在这个聊天里弹出《有还款能力拒不还款责任书》，对方在页面上手写签名即可。对方问在哪里签时，只说“责任书已经在聊天里弹出来了，点开就能签”，绝不要说发微信、发短信、发邮件、邮寄。
 14. 信息追问：对方透露收入、工作、家庭、资产等信息但不完整时，必须先追问补全再谈还款。比如对方说“一个月才 3000 块钱”，必须问“做什么工作？”；对方说“在公司上班”，必须问“在公司做什么？一个月收入多少？”追问要自然，套在还款话题里（“我帮您算算一个月能还多少”），不要像查户口。一次只问一个信息，不要连珠炮。
+15. 弱点切入：画像里列出的弱点就是切入点。对方怕什么就从哪里切入：怕丢面子就点明体面解决的路；怕法律就讲清后果与今天处理的划算；有资产就提保全；前后矛盾当场点破；失信就拿上次的承诺说事。切入要准，一次只打一个弱点，不要全抖出来。
 
 【标准示范由后台话术设置（chat_scripts 表）提供，见下文“后台话术”一节，与关键词规则同一套，不另写。】`;
 
@@ -473,6 +475,24 @@ function buildGenerateReplySystem(
     );
     const leverage = analyzeLeverage(row);
     if (leverage) profileLines.push(`弱点/杠杆：${leverage}`);
+    // 人格五维（人格学）：getCasePsychContext 里已按当前这句话算好。
+    const person = profile?.personality;
+    if (person)
+      profileLines.push(
+        `人格：合作性${person.cooperativeness}、焦虑度${person.anxiety}、面子敏感${person.faceSensitivity}、责任心${person.conscientiousness}、冲动性${person.impulsiveness}。`,
+      );
+    // 弱点（七学科综合）：已捕到的弱点标签 + 每个弱点的切入打法。
+    const tags = (row.weaknessTags ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (tags.length > 0) {
+      const lines = tags
+        .filter((t) => WEAKNESS_LEVERAGE[t])
+        .map((t) => `${WEAKNESS_LABELS[t]}：${WEAKNESS_LEVERAGE[t]}`);
+      if (lines.length > 0)
+        profileLines.push(`已捕弱点（切入点）：${lines.join("；")}。`);
+    }
     // 待补信息：画像里还缺的关键项，直接点出来让模型先问，别急着谈还款。
     const missing: string[] = [];
     const occNow = (row.occupation ?? "").trim();
@@ -639,6 +659,7 @@ export interface PsychProfile {
   age: number | null;
   gender: string;
   debtTier: string;
+  personality: PersonalityProfile;
 }
 
 const ARCHETYPE_RULES: {
@@ -905,6 +926,136 @@ function analyzeLeverage(
   return parts.join("；");
 }
 
+/* ---------------- 多维画像（2026-11-12，用户令“综合起来搭建”）
+   不只心理学。七个学科拼一张画像，弱点不只性格弱点：
+   心理学（类型/阶段/语气）+ 人格学（五维特质）+ 经济学（收入/偿还力）
+   + 法学（执行风险）+ 社会学（面子/家庭/单位）+ 行为学（守约/一致性）
+   + 沟通学（语言信号）。弱点在沟通时实时捕捉，存案件上累积。 */
+
+export type PersonalityTrait = "高" | "中" | "低";
+export interface PersonalityProfile {
+  cooperativeness: PersonalityTrait; // 合作性：愿不愿谈、愿不愿还
+  anxiety: PersonalityTrait; // 焦虑度：怕不怕、压力大不大
+  faceSensitivity: PersonalityTrait; // 面子敏感：多在乎别人知道
+  conscientiousness: PersonalityTrait; // 责任心：守不守承诺
+  impulsiveness: PersonalityTrait; // 冲动性：会不会撂狠话、翻脸
+}
+
+/** 人格五维：从当前这句话 + 心理类型 + 案件阶段推。 */
+function assessPersonality(
+  text: string,
+  psych: { stage: string; archetype: string },
+): PersonalityProfile {
+  const t = text ?? "";
+  const has = (...res: RegExp[]) => res.some((re) => re.test(t));
+  const coop: PersonalityTrait =
+    psych.archetype === "配合型"
+      ? "高"
+      : psych.archetype === "对抗型" || psych.archetype === "失信型"
+        ? "低"
+        : "中";
+  const anxiety: PersonalityTrait = has(
+    /害怕|担心|睡不着|压力大|着急|心慌|焦虑|愁/,
+  )
+    ? "高"
+    : "低";
+  const face: PersonalityTrait = has(
+    /丢人|面子|别让人知道|别告诉|别去单位|别影响工作|别让.*知道/,
+  )
+    ? "高"
+    : "中";
+  const consc: PersonalityTrait =
+    psych.stage === "违约逾期" || psych.archetype === "失信型"
+      ? "低"
+      : psych.stage === "已承诺"
+        ? "高"
+        : "中";
+  const impuls: PersonalityTrait = has(
+    /起诉|随便|爱咋咋地|滚|有本事|不怕|大不了|随你便/,
+  )
+    ? "高"
+    : "低";
+  return {
+    cooperativeness: coop,
+    anxiety,
+    faceSensitivity: face,
+    conscientiousness: consc,
+    impulsiveness: impuls,
+  };
+}
+
+/** 弱点标签：face 面子 / legal_fear 法律畏惧 / asset 资产可执行 /
+    income 收入可执行 / anxiety 焦虑 / contradiction 前后矛盾 /
+    promise_broken 失信 / family 家庭牵挂 / pride 自尊强。 */
+export const WEAKNESS_LABELS: Record<string, string> = {
+  face: "怕丢面子",
+  legal_fear: "怕法律后果",
+  asset: "有资产可执行",
+  income: "有收入可执行",
+  anxiety: "焦虑/压力大",
+  contradiction: "前后矛盾",
+  promise_broken: "失信/爽约",
+  family: "家庭牵挂",
+  pride: "自尊强",
+};
+
+/** 每个弱点的切入打法：一句话，准、狠、一次只打一个。 */
+export const WEAKNESS_LEVERAGE: Record<string, string> = {
+  face: "怕丢面子：点明此事若闹到单位/家人会更丢人，今天付一笔就能体面解决",
+  legal_fear:
+    "怕法律后果：讲清一旦进入执行程序，后果比现在严重得多，今天处理最划算",
+  asset: "有资产可执行：有房/有车可保全查封，主动还比被执行强",
+  income: "有收入可执行：有稳定收入，工资可被划扣，分期是体面的出路",
+  anxiety: "焦虑：先付一笔锁定，压力马上小一半，剩下的慢慢来",
+  contradiction: "前后矛盾：当场点破，让他没法再编",
+  promise_broken: "失信：拿上次的承诺说事，这次不能再拖了",
+  family: "家庭牵挂：为了孩子/家人不受影响，今天先解决",
+  pride: "自尊强：主动还清是体面的事，拖下去才真丢人",
+};
+
+/** 从当前这句话 + 画像 + 阶段捕捉弱点信号。返回新发现的标签。 */
+function detectWeaknessSignals(
+  text: string,
+  row: typeof schema.cases.$inferSelect,
+  psych: { stage: string; archetype: string },
+): string[] {
+  const t = text ?? "";
+  const found: string[] = [];
+  const add = (tag: string) => {
+    if (!found.includes(tag)) found.push(tag);
+  };
+  const has = (...res: RegExp[]) => res.some((re) => re.test(t));
+  // 社会学：面子。怕人知道、怕丢人、怕影响工作。
+  if (has(/丢人|面子|别让人知道|别告诉|别去单位|别影响工作|别让.*知道/))
+    add("face");
+  // 法学：怕法律后果。提到法院/起诉/黑名单/坐牢，说明心里有数。
+  if (has(/法院|起诉|黑名单|失信|坐牢|警察|强制执行|冻结|查封/))
+    add("legal_fear");
+  // 经济学：资产。画像里有房有车 = 可执行财产。
+  const bg = `${row.backgroundNote ?? ""} ${row.occupation ?? ""}`;
+  if (/有房|有车/.test(bg)) add("asset");
+  // 经济学：收入。有稳定工作 + 月收入已知 = 工资可执行。
+  if ((row.occupation ?? "").trim() && (Number(row.monthlyIncomeCents) || 0) > 0)
+    add("income");
+  // 心理学：焦虑。害怕、担心、睡不着、压力大。
+  if (has(/害怕|担心|睡不着|压力大|着急|心慌|焦虑|愁/)) add("anxiety");
+  // 沟通学：前后矛盾。一边说没钱，一边提花钱/买东西。
+  if (
+    has(/没钱|还不起|还不上/) &&
+    has(/买了|花了|刚买|旅游|吃喝|新手机|新车/)
+  )
+    add("contradiction");
+  // 行为学：失信。阶段已到违约逾期 = 承诺过又拖了。
+  if (psych.stage === "违约逾期" || psych.archetype === "失信型")
+    add("promise_broken");
+  // 社会学：家庭牵挂。提到孩子/家人 + 怕影响他们。
+  if (has(/孩子|老婆|老公|父母|家人/) && has(/别影响|怕.*知道|担心/))
+    add("family");
+  // 人格学：自尊强。强调“我不是不还”“别把我当老赖”。
+  if (has(/不是不还|别把我当|我有尊严|我不是老赖|我会还/)) add("pride");
+  return found;
+}
+
 /** 算出一个案件当前的心理画像：阶段 + 类型 + 语气 + 年龄/性别/金额档。 */
 async function getCasePsychContext(
   ctx: Ctx,
@@ -959,6 +1110,7 @@ async function getCasePsychContext(
     age,
     gender,
     debtTier: debtTier(caseRow.totalDueCents),
+    personality: assessPersonality(currentText, { stage, archetype }),
   };
 }
 
@@ -2147,6 +2299,7 @@ function toCaseOut(
     note: row.note,
     entryPoint: row.entryPoint ?? "",
     monthlyIncomeCents: row.monthlyIncomeCents ?? 0,
+    weaknessTags: row.weaknessTags ?? "",
     needsHuman: row.needsHuman === 1,
     humanNote: row.humanNote,
     humanTakeover: row.humanTakeoverAt != null,
@@ -5573,6 +5726,25 @@ const baseActions = {
       // 心理画像：算出当前案件的阶段、债务人心理类型与语气，话术匹配
       // 与提示词都按画像来。
       const psych = await getCasePsychContext(ctx, row, args.text ?? "");
+      // 弱点捕捉：从这句话 + 画像 + 阶段抓弱点信号，累积存案件上。
+      try {
+        const signals = detectWeaknessSignals(args.text ?? "", row, psych);
+        const cur = (row.weaknessTags ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const add = signals.filter((t) => !cur.includes(t));
+        if (add.length > 0) {
+          const merged = [...cur, ...add].join(",");
+          await db
+            .update(schema.cases)
+            .set({ weaknessTags: merged })
+            .where(eq(schema.cases.id, args.caseId));
+          (row as { weaknessTags: string }).weaknessTags = merged;
+        }
+      } catch {
+        // 弱点捕捉失败不影响回话本身。
+      }
       const learned = await loadLearnedScripts(
         ctx,
         args.text ?? "",

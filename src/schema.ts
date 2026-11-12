@@ -25,6 +25,9 @@ export const cases = sqliteTable("cases", {
   // 月收入（分）：沟通中从债务人话里抽取（如“一个月才 3000 块钱”），
   // 用于算每月可还额与弱点分析；0 = 未知。
   monthlyIncomeCents: integer("monthly_income_cents").notNull().default(0),
+  // 沟通中捕到的弱点标签（逗号分隔）：face/legal_fear/asset/income/
+  // anxiety/contradiction/promise_broken/family/pride；专员与 AI 共用。
+  weaknessTags: text("weakness_tags").notNull().default(""),
   needsHuman: integer("needs_human").notNull().default(0),
   humanNote: text("human_note").notNull().default(""),
   // 人工接管时间戳：null = 机器人值守（债务人页按话术自动回复），

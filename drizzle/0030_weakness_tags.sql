@@ -1,0 +1,1 @@
+ALTER TABLE cases ADD COLUMN weakness_tags TEXT NOT NULL DEFAULT '';
