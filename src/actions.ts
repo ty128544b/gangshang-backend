@@ -2458,6 +2458,12 @@ async function computeOperatorPerformance(
 
   const rows = raws.map((r) => {
     const suggestions: string[] = [];
+    /* 无数据不是“表现良好”：0 案件或有案件但 0 沟通时，不能落到“表现稳定”那句兜底上。 */
+    if (r.caseCount === 0) {
+      suggestions.push("暂无负责案件，暂无评估数据。");
+    } else if (r.debtorMessageCount === 0 && r.agentMessageCount === 0) {
+      suggestions.push("名下有案件但暂无沟通记录，建议主动联系债务人跟进。");
+    }
     if (r.caseCount > 0 && r.recoveryRate < teamAvgRate) {
       suggestions.push(
         `回款率 ${(r.recoveryRate * 100).toFixed(1)}% 低于团队平均 ${(teamAvgRate * 100).toFixed(1)}%，建议优先跟进名下的高意愿名单，先把有意愿的转成回款。`,
