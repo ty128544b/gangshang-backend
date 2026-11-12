@@ -25,6 +25,9 @@ const caseFields = {
   originalCreditor: z.string().default(""),
   transferAgreementNo: z.string().default(""),
   note: z.string().default(""),
+  education: z.string().default(""),
+  occupation: z.string().default(""),
+  backgroundNote: z.string().default(""),
 };
 
 const caseOut = z.object({
@@ -40,6 +43,7 @@ const caseOut = z.object({
   originalCreditor: z.string(),
   transferAgreementNo: z.string(),
   note: z.string(),
+  entryPoint: z.string(),
   needsHuman: z.boolean(),
   humanNote: z.string(),
   humanTakeover: z.boolean(),
@@ -390,6 +394,7 @@ function buildGenerateReplySystem(
   row: typeof schema.cases.$inferSelect,
   learned: string[] = [],
   scripts?: ChatScriptsData | null,
+  profile?: PsychProfile | null,
 ): string {
   const totalYuan = (Number(row.totalDueCents) || 0) / 100;
   const interestCents = Math.max(
@@ -452,6 +457,36 @@ function buildGenerateReplySystem(
     }
     if (sections.length > 0) base += `\n\n${sections.join("\n\n")}`;
   }
+  // 债务人画像（心理画像系统）：年龄/性别/金额档/心理类型/案件阶段/语气。
+  // 同一句话在不同阶段、不同类型的人面前，回答必须不一样。
+  if (profile) {
+    const profileLines: string[] = [];
+    const ageStr = profile.age != null ? `约 ${profile.age} 岁` : "年龄未知";
+    const genderStr = profile.gender ? `（${profile.gender}）` : "";
+    profileLines.push(
+      `年龄：${ageStr}${genderStr}；欠款 ${yuanForPrompt(row.totalDueCents)}（${profile.debtTier}），逾期 ${Number(row.overdueDays) || 0} 天。`,
+    );
+    profileLines.push(
+      `心理类型：${profile.archetype || "未定型"}；案件阶段：${profile.stage}。`,
+    );
+    // 切入点：导入时已评估的直接用；老案件（导入时还没这功能）现场算一个。
+    const entry = (row.entryPoint ?? "").trim() || assessEntryPoint(row);
+    if (entry) profileLines.push(`切入点（导入时评估）：${entry}`);
+    profileLines.push(`语气指引：${profile.tone}`);
+    const edu = (row.education ?? "").trim();
+    const occ = (row.occupation ?? "").trim();
+    const bg = (row.backgroundNote ?? "").trim();
+    if (edu || occ || bg) {
+      profileLines.push(
+        `背景：${[edu ? `学历${edu}` : "", occ ? `职业${occ}` : "", bg].filter(Boolean).join("；")}`,
+      );
+    }
+    if (profile.age != null && profile.age < 30)
+      profileLines.push("年轻债务人：用直接、简短的口语，不绕弯子。");
+    if (profile.age != null && profile.age > 55)
+      profileLines.push("年长债务人：语气尊重、耐心，多给一步台阶。");
+    base += `\n\n【债务人画像】\n${profileLines.join("\n")}`;
+  }
   // 已学成功话术（专员平时说话 + 真实催回过款的，整条入库、去重后）：
   // 当示范追加，数字按本案填。这是 AI 口气的标准，优先照着这个风格回。
   if (learned.length === 0) return base;
@@ -512,10 +547,26 @@ async function learnAgentMessage(
     } catch {
       trigger = "";
     }
+    // 画像标签：学话术时记下当时的案件阶段、债务人心理类型与语气，
+    // 以后按 trigger + stage + archetype 一起匹配。
+    let psych: PsychProfile | null = null;
+    try {
+      const caseRows = await db
+        .select()
+        .from(schema.cases)
+        .where(eq(schema.cases.id, caseId))
+        .limit(1);
+      if (caseRows[0]) psych = await getCasePsychContext(ctx, caseRows[0]);
+    } catch {
+      psych = null;
+    }
     await db.insert(schema.learnedScripts).values({
       text: deNumberScript(text),
       normalized,
       trigger,
+      stage: psych?.stage ?? "",
+      archetype: psych?.archetype ?? "",
+      tone: psych?.tone ?? "",
       sourceCaseId: caseId,
     });
   } catch {
@@ -549,9 +600,260 @@ function longestCommonSubstring(a: string, b: string): number {
   }
   return best;
 }
+/* ---------------- 债务人心理画像系统（2026-11-12，用户令“科学搭建”）
+   维度：年龄/性别（身份证号推导）+ 欠款档位 + 心理类型 + 案件阶段 + 语气。
+   心理类型按债务人言行判定，案件阶段按案件进展判定；学话术时把当时的
+   stage/archetype/tone 一起记下来，用时按 trigger + stage + archetype
+   一起匹配——同一句话在不同阶段、不同类型的人面前，回答必须不一样。 */
+export type DebtorArchetype =
+  | "对抗型"
+  | "困难型"
+  | "拖延型"
+  | "配合型"
+  | "失信型"
+  | "逃避型"
+  | "";
+export type CaseStage = "初次接触" | "协商谈判" | "已承诺" | "违约逾期" | "法律施压";
+
+export interface PsychProfile {
+  stage: CaseStage;
+  archetype: DebtorArchetype;
+  tone: string;
+  age: number | null;
+  gender: string;
+  debtTier: string;
+}
+
+const ARCHETYPE_RULES: {
+  type: Exclude<DebtorArchetype, "">;
+  re: RegExp;
+}[] = [
+  { type: "对抗型", re: /不还|起诉|随便|不怕|你能怎样|报警|法院见|爱咋咋|有本事/ },
+  { type: "困难型", re: /失业|生病|住院|看病|工资低|没工作|家里困难|借不到|吃饭都难|孩子上学|老人生病/ },
+  { type: "拖延型", re: /下个月|过几天|考虑|缓缓|再等等|发工资|过段时间|等一等|晚几天|拖一拖/ },
+  { type: "配合型", re: /付多少|怎么还|账号|二维码|收款码|能还|我还|马上还|今天还|分期/ },
+];
+
+const PROMISE_RE =
+  /(还|付|给|转|打).*(明天|后天|下周|下个月|月底|\d+号|发工资)|(明天|后天|下周|下个月|月底|\d+号|发工资).*(还|付|给|转|打)/;
+const DELAY_AFTER_PROMISE_RE = /再缓|再等|晚几天|拖一拖|缓一缓|下个月|过几天|没办法|还不上/;
+const REFUSAL_RE = /不还|拒绝|还不起/;
+
+function detectArchetype(
+  debtorTexts: string[],
+  brokenPromise: boolean,
+  debtorMsgCount: number,
+  agentMsgCount: number,
+): DebtorArchetype {
+  if (brokenPromise) return "失信型";
+  const joined = debtorTexts.join(" ");
+  for (const rule of ARCHETYPE_RULES) {
+    if (rule.re.test(joined)) return rule.type;
+  }
+  if (debtorMsgCount === 0 && agentMsgCount >= 2) return "逃避型";
+  return "";
+}
+
+async function detectCaseStage(
+  ctx: Ctx,
+  caseId: number,
+  debtorMessages: { text: string; createdAt: Date }[],
+): Promise<{ stage: CaseStage; brokenPromise: boolean }> {
+  const db = ctx.db<typeof schema>();
+  // 阶段 5 法律施压：责任书已生成（待签署或已签署），压倒一切。
+  try {
+    const docs = await db
+      .select({ id: schema.liabilityDocuments.id })
+      .from(schema.liabilityDocuments)
+      .where(eq(schema.liabilityDocuments.caseId, caseId))
+      .limit(1);
+    if (docs.length > 0) return { stage: "法律施压", brokenPromise: false };
+  } catch {
+    // 忽略
+  }
+  // 找最近一条承诺消息（债务人说过某天还/付）。
+  let promiseIdx = -1;
+  for (let i = debtorMessages.length - 1; i >= 0; i--) {
+    if (PROMISE_RE.test(debtorMessages[i].text)) {
+      promiseIdx = i;
+      break;
+    }
+  }
+  if (promiseIdx >= 0) {
+    // 承诺之后又有拖延/拒绝，或承诺已过 7 天仍无还款 → 失信。
+    const after = debtorMessages.slice(promiseIdx + 1);
+    const brokenByWords = after.some(
+      (m) => DELAY_AFTER_PROMISE_RE.test(m.text) || REFUSAL_RE.test(m.text),
+    );
+    let brokenByTime = false;
+    try {
+      const promiseAt = debtorMessages[promiseIdx].createdAt.getTime();
+      if (promiseAt < Date.now() - 7 * 24 * 3600 * 1000) {
+        const pays = await db
+          .select({ id: schema.payments.id })
+          .from(schema.payments)
+          .where(eq(schema.payments.caseId, caseId))
+          .limit(1);
+        brokenByTime = pays.length === 0;
+      }
+    } catch {
+      brokenByTime = false;
+    }
+    if (brokenByWords || brokenByTime) {
+      return { stage: "违约逾期", brokenPromise: true };
+    }
+    return { stage: "已承诺", brokenPromise: false };
+  }
+  if (debtorMessages.length >= 3) return { stage: "协商谈判", brokenPromise: false };
+  return { stage: "初次接触", brokenPromise: false };
+}
+
+function toneForStageArchetype(stage: CaseStage, archetype: DebtorArchetype): string {
+  if (stage === "法律施压")
+    return "正式、法律口径：只陈述法律后果与程序，不争吵、不威胁，引用责任书与法条。";
+  if (stage === "违约逾期")
+    return "严厉、后果明确：指出对方已失信，限定最后期限，说明下一步就是法律程序。";
+  if (stage === "已承诺")
+    return "确认提醒、守约：确认约定的日期与金额，提醒按时履行，表达信任。";
+  if (archetype === "对抗型")
+    return "冷静、不激化：不与对方争吵，只摆事实与后果，语气平稳坚定。";
+  if (archetype === "困难型")
+    return "共情、小额分步：先理解困难，再提今天先付一小笔锁定金，分步解决。";
+  if (archetype === "拖延型")
+    return "坚定推进、给台阶：不接受模糊日期，今天就要一个具体日期和金额。";
+  if (archetype === "配合型")
+    return "高效直接、给方案：直接给付款信息与步骤，不绕弯子。";
+  if (archetype === "逃避型")
+    return "温和唤醒、留后路：提醒对方一直未回复，说明后果，留一个回复入口。";
+  return "共情理解、明确告知：先说明欠款事实与后果，再问对方打算怎么还。";
+}
+
+function parseIdCardProfile(idCard: string): { age: number | null; gender: string } {
+  // 第 17 位是性别码（奇男偶女），第 18 位是校验码；不要拿校验码当性别。
+  const m = /^(\d{6})(\d{4})(\d{2})(\d{2})\d{2}(\d)\d$/.exec((idCard ?? "").trim());
+  if (!m) return { age: null, gender: "" };
+  const birthYear = Number(m[2]);
+  const birthMonth = Number(m[3]);
+  const birthDay = Number(m[4]);
+  const now = new Date();
+  let age = now.getFullYear() - birthYear;
+  if (
+    now.getMonth() + 1 < birthMonth ||
+    (now.getMonth() + 1 === birthMonth && now.getDate() < birthDay)
+  ) {
+    age -= 1;
+  }
+  if (age < 0 || age > 120) return { age: null, gender: "" };
+  const genderDigit = Number(m[5]);
+  return { age, gender: genderDigit % 2 === 1 ? "男" : "女" };
+}
+
+function debtTier(totalDueCents: number): string {
+  const yuan = (Number(totalDueCents) || 0) / 100;
+  if (yuan < 10000) return "小额";
+  if (yuan <= 30000) return "中额";
+  return "大额";
+}
+
+/** 导入时科学评估定切入点（用户 2026-11-12 定）：案件一进来就按年龄/
+ * 性别/金额档/逾期天数/背景算出首次接触从哪里切入，存案件上，专员与
+ * AI 共用。沟通中再按债务人心理反应实时调话术，逐步攻破防线。 */
+function assessEntryPoint(args: {
+  idCard?: string;
+  totalDueCents?: number;
+  overdueDays?: number;
+  education?: string;
+  occupation?: string;
+  backgroundNote?: string;
+}): string {
+  const { age, gender } = parseIdCardProfile(args.idCard ?? "");
+  const tier = debtTier(Number(args.totalDueCents) || 0);
+  const overdue = Number(args.overdueDays) || 0;
+  const parts: string[] = [];
+  if (age != null && age < 30)
+    parts.push("年轻债务人：直接、短句，不绕弯子，先给手机端付款入口");
+  else if (age != null && age > 55)
+    parts.push("年长债务人：语气尊重、耐心，先讲清欠款事实再谈方案，多给台阶");
+  else if (age != null)
+    parts.push("中年债务人：理性沟通，先摆事实再给方案");
+  if (gender === "女") parts.push("注意措辞温和，避免压迫感过强");
+  if (tier === "小额") parts.push("小额欠款：主推一次结清，强调一次还清最省事");
+  else if (tier === "中额") parts.push("中额欠款：主推今天先付一笔锁定金，余款分期");
+  else parts.push("大额欠款：正式、严肃，先确认还款意愿再谈分期，必要时走法律程序");
+  if (overdue >= 1000)
+    parts.push("超长期逾期：直接点明已逾期多年，失信后果已产生，限期处理");
+  else if (overdue >= 365) parts.push("长期逾期：强调逾期时间与后果，推进尽快处理");
+  else parts.push("逾期不久：先提醒、再协商，给出台阶");
+  const bg = [args.education, args.occupation, args.backgroundNote]
+    .map((s) => (s ?? "").trim())
+    .filter(Boolean)
+    .join("；");
+  if (bg) parts.push(`背景参考：${bg}`);
+  return parts.join("；");
+}
+
+/** 算出一个案件当前的心理画像：阶段 + 类型 + 语气 + 年龄/性别/金额档。 */
+async function getCasePsychContext(
+  ctx: Ctx,
+  caseRow: typeof schema.cases.$inferSelect,
+  currentText = "",
+): Promise<PsychProfile> {
+  const db = ctx.db<typeof schema>();
+  let debtorMessages: { text: string; createdAt: Date }[] = [];
+  try {
+    debtorMessages = await db
+      .select({
+        text: schema.chatMessages.text,
+        createdAt: schema.chatMessages.createdAt,
+      })
+      .from(schema.chatMessages)
+      .where(
+        and(
+          eq(schema.chatMessages.caseId, caseRow.id),
+          eq(schema.chatMessages.sender, "debtor"),
+        ),
+      )
+      .orderBy(asc(schema.chatMessages.id))
+      .limit(50);
+  } catch {
+    debtorMessages = [];
+  }
+  const texts = debtorMessages.map((m) => m.text);
+  if (currentText.trim()) texts.push(currentText);
+  const { stage, brokenPromise } = await detectCaseStage(ctx, caseRow.id, debtorMessages);
+  let agentCount = 0;
+  try {
+    const agents = await db
+      .select({ id: schema.chatMessages.id })
+      .from(schema.chatMessages)
+      .where(
+        and(
+          eq(schema.chatMessages.caseId, caseRow.id),
+          eq(schema.chatMessages.sender, "agent"),
+        ),
+      )
+      .limit(10);
+    agentCount = agents.length;
+  } catch {
+    agentCount = 0;
+  }
+  const archetype = detectArchetype(texts, brokenPromise, debtorMessages.length, agentCount);
+  const { age, gender } = parseIdCardProfile(caseRow.idCard ?? "");
+  return {
+    stage,
+    archetype,
+    tone: toneForStageArchetype(stage, archetype),
+    age,
+    gender,
+    debtTier: debtTier(caseRow.totalDueCents),
+  };
+}
+
 async function loadLearnedScripts(
   ctx: Ctx,
   debtorText = "",
+  stage = "",
+  archetype = "",
   limit = 8,
 ): Promise<string[]> {
   const db = ctx.db<typeof schema>();
@@ -562,27 +864,64 @@ async function loadLearnedScripts(
     .limit(200);
   if (rows.length === 0) return [];
   const msg = normalizeMatchText(debtorText);
-  const scored = rows.map((r) => ({
-    row: r,
-    score: msg.length >= 2 && r.trigger
-      ? longestCommonSubstring(normalizeMatchText(r.trigger), msg)
-      : 0,
-  }));
-  const matched = scored
-    .filter((s) => s.score >= 2)
-    .sort((a, b) => b.score - a.score || b.row.id - a.row.id);
+  // 打分：trigger 是门槛（公共子串 ≥2 字才算命中）；同阶段 +5、同类型 +3，
+  // 再按 trigger 长度加权。分层取：同阶段且 trigger 命中的优先（同一句话
+  // 在不同阶段必须回得不一样），其次 trigger 命中但阶段不同的，最后
+  // 用最新话术补满。
+  const scored = rows.map((r) => {
+    const triggerScore =
+      msg.length >= 2 && r.trigger
+        ? longestCommonSubstring(normalizeMatchText(r.trigger), msg)
+        : 0;
+    const stageScore = stage && r.stage === stage ? 5 : 0;
+    const archetypeScore = archetype && r.archetype === archetype ? 3 : 0;
+    return {
+      row: r,
+      triggerScore,
+      stageMatch: stageScore > 0,
+      total: triggerScore * 2 + stageScore + archetypeScore,
+    };
+  });
+  const byTotal = (a: (typeof scored)[number], b: (typeof scored)[number]) =>
+    b.total - a.total || b.row.id - a.row.id;
+  const byIdDesc = (a: (typeof scored)[number], b: (typeof scored)[number]) =>
+    b.row.id - a.row.id;
+  // 分层取（同一句话在不同阶段必须回得不一样）：同阶段且 trigger 命中
+  // 最优先；其次同阶段（trigger 不对也行，语气要对）；再 trigger 命中
+  // 但阶段不同；最后用最新话术补满。库还小时同阶段可能没话术，自动降级。
+  const tier1 = scored
+    .filter((s) => s.triggerScore >= 2 && s.stageMatch)
+    .sort(byTotal);
+  const tier2 = scored
+    .filter((s) => s.triggerScore < 2 && s.stageMatch)
+    .sort(byIdDesc);
+  const tier3 = scored
+    .filter((s) => s.triggerScore >= 2 && !s.stageMatch)
+    .sort(byTotal);
   const picked: typeof rows = [];
   const seen = new Set<number>();
-  for (const s of matched) {
-    if (picked.length >= limit) break;
-    picked.push(s.row);
-    seen.add(s.row.id);
-  }
-  for (const r of rows) {
-    if (picked.length >= limit) break;
-    if (!seen.has(r.id)) {
-      picked.push(r);
-      seen.add(r.id);
+  const sameStage = [...tier1, ...tier2];
+  if (sameStage.length > 0) {
+    // 库里有同阶段话术时，只给同阶段的示范——不同阶段的话术混进来，
+    // 模型会挑最顺口的那条，阶段就白分了。宁可示范少几条，也不要错阶段。
+    for (const s of sameStage) {
+      if (picked.length >= limit) break;
+      picked.push(s.row);
+      seen.add(s.row.id);
+    }
+  } else {
+    // 库里还没有同阶段话术：先用 trigger 命中的，再用最新的补满。
+    for (const s of tier3) {
+      if (picked.length >= limit) break;
+      picked.push(s.row);
+      seen.add(s.row.id);
+    }
+    for (const r of rows) {
+      if (picked.length >= limit) break;
+      if (!seen.has(r.id)) {
+        picked.push(r);
+        seen.add(r.id);
+      }
     }
   }
   return picked.map((r) => r.text);
@@ -616,10 +955,24 @@ async function promoteLearnedScripts(
       .limit(1);
     if (exists.length > 0) continue;
     try {
+      let psych: PsychProfile | null = null;
+      try {
+        const caseRows = await db
+          .select()
+          .from(schema.cases)
+          .where(eq(schema.cases.id, caseId))
+          .limit(1);
+        if (caseRows[0]) psych = await getCasePsychContext(ctx, caseRows[0]);
+      } catch {
+        psych = null;
+      }
       await db.insert(schema.learnedScripts).values({
         text: deNumberScript(r.reply),
         normalized,
         trigger: r.trigger,
+        stage: psych?.stage ?? "",
+        archetype: psych?.archetype ?? "",
+        tone: psych?.tone ?? "",
         sourceCaseId: caseId,
       });
       added++;
@@ -1679,6 +2032,7 @@ function toCaseOut(
     originalCreditor: row.originalCreditor,
     transferAgreementNo: row.transferAgreementNo,
     note: row.note,
+    entryPoint: row.entryPoint ?? "",
     needsHuman: row.needsHuman === 1,
     humanNote: row.humanNote,
     humanTakeover: row.humanTakeoverAt != null,
@@ -3692,6 +4046,7 @@ const baseActions = {
         .values({
           ...args,
           idCard: args.idCard.trim().toUpperCase(),
+          entryPoint: assessEntryPoint(args),
           assigneeId: creatorAssigneeId,
         })
         .returning({ id: schema.cases.id });
@@ -3770,6 +4125,7 @@ const baseActions = {
           .values({
             ...fields,
             idCard: fields.idCard.trim().toUpperCase(),
+            entryPoint: assessEntryPoint(fields),
             assigneeId:
               session && session.role === "user" ? session.operatorId : null,
           })
@@ -5059,14 +5415,22 @@ const baseActions = {
       // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
       // 已学成功话术一并拼进提示词当示范。
       // 后台话术与关键词规则同一套 chat_scripts 表：后台改完，AI 即用同一套。
-      const learned = await loadLearnedScripts(ctx, args.text ?? "");
+      // 心理画像：算出当前案件的阶段、债务人心理类型与语气，话术匹配
+      // 与提示词都按画像来。
+      const psych = await getCasePsychContext(ctx, row, args.text ?? "");
+      const learned = await loadLearnedScripts(
+        ctx,
+        args.text ?? "",
+        psych.stage,
+        psych.archetype,
+      );
       let scripts: ChatScriptsData | null = null;
       try {
         scripts = await loadChatScripts(ctx);
       } catch {
         scripts = null;
       }
-      const system = buildGenerateReplySystem(row, learned, scripts);
+      const system = buildGenerateReplySystem(row, learned, scripts, psych);
       const history = (args.history ?? []).slice(-6).map((m) => ({
         role: m.role,
         content: m.content,

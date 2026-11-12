@@ -13,6 +13,15 @@ export const cases = sqliteTable("cases", {
   originalCreditor: text("original_creditor").notNull().default(""),
   transferAgreementNo: text("transfer_agreement_no").notNull().default(""),
   note: text("note").notNull().default(""),
+  // 债务人背景（2026-11-12 心理画像系统）：学历/职业/经历备注，专员或
+  // 导入时填写；有值时进提示词当画像参考，无值不影响。年龄/性别从身份证号
+  // 自动推导，不另存。
+  education: text("education").notNull().default(""),
+  occupation: text("occupation").notNull().default(""),
+  backgroundNote: text("background_note").notNull().default(""),
+  // 导入时科学评估定下的切入点（2026-11-12 心理画像系统）：按年龄/性别/
+  // 金额档/逾期天数/背景算出的首次接触角度，存下来给专员与 AI 共用。
+  entryPoint: text("entry_point").notNull().default(""),
   needsHuman: integer("needs_human").notNull().default(0),
   humanNote: text("human_note").notNull().default(""),
   // 人工接管时间戳：null = 机器人值守（债务人页按话术自动回复），
@@ -488,6 +497,11 @@ export const learnedScripts = sqliteTable("learned_scripts", {
   text: text("text").notNull(),
   normalized: text("normalized").notNull(),
   trigger: text("trigger").notNull().default(""),
+  // 心理画像标签（2026-11-12 心理画像系统）：学话术时记下当时的案件阶段、
+  // 债务人心理类型与语气；用时按 trigger + stage + archetype 一起匹配。
+  stage: text("stage").notNull().default(""),
+  archetype: text("archetype").notNull().default(""),
+  tone: text("tone").notNull().default(""),
   sourceCaseId: integer("source_case_id").notNull(),
   useCount: integer("use_count").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
