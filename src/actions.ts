@@ -2450,11 +2450,6 @@ async function computeOperatorPerformance(
     withCases.length > 0
       ? withCases.reduce((s, r) => s + r.recoveryRate, 0) / withCases.length
       : 0;
-  const maxCaseCount = Math.max(0, ...raws.map((r) => r.caseCount));
-  const avgCaseCount =
-    withCases.length > 0
-      ? withCases.reduce((s, r) => s + r.caseCount, 0) / withCases.length
-      : 0;
 
   const rows = raws.map((r) => {
     const suggestions: string[] = [];
@@ -2467,15 +2462,6 @@ async function computeOperatorPerformance(
     if (r.caseCount > 0 && r.recoveryRate < teamAvgRate) {
       suggestions.push(
         `回款率 ${(r.recoveryRate * 100).toFixed(1)}% 低于团队平均 ${(teamAvgRate * 100).toFixed(1)}%，建议优先跟进名下的高意愿名单，先把有意愿的转成回款。`,
-      );
-    }
-    if (
-      r.caseCount > 0 &&
-      r.caseCount === maxCaseCount &&
-      r.caseCount > avgCaseCount
-    ) {
-      suggestions.push(
-        `手头 ${r.caseCount} 个案件是团队最多，积压风险高，建议请分案主管分流一部分案件，避免跟进不过来。`,
       );
     }
     if (r.highUnfollowedCount > 0) {
@@ -7238,7 +7224,7 @@ const baseActions = {
 
   getOperatorPerformance: defineAction({
     description:
-      "操作员回款能力分析（大数据统计页版块）：每个操作员一行——负责案件数、总欠款、已回款、回款率、平均回款天数（建档到第一笔确认回款）、高意愿未回款数；沟通信号来自其名下案件的聊天记录：债务人消息数、我方回复数、平均回复时长（小时）、高意愿未跟进数（高意愿且未结清、最后一条债务人消息后还没有我方回复的案件）、拖延信号总次数与抓到（其后有我方回复跟进）次数；建议由服务端按规则生成（回款率低于团队平均、积压最多、高意愿未跟进、拖延信号没抓到、回复不及时，无问题时为表现稳定）。管理员与分案主管看全部操作员，普通操作员只返回自己一行。",
+      "操作员回款能力分析（大数据统计页版块）：每个操作员一行——负责案件数、总欠款、已回款、回款率、平均回款天数（建档到第一笔确认回款）、高意愿未回款数；沟通信号来自其名下案件的聊天记录：债务人消息数、我方回复数、平均回复时长（小时）、高意愿未跟进数（高意愿且未结清、最后一条债务人消息后还没有我方回复的案件）、拖延信号总次数与抓到（其后有我方回复跟进）次数；建议由服务端按规则生成（回款率低于团队平均、高意愿未跟进、拖延信号没抓到、回复不及时；0 案件或 0 沟通时不评好坏，只说暂无数据。无问题时为表现稳定）。管理员与分案主管看全部操作员，普通操作员只返回自己一行。",
     request: z.object({}),
     response: z.object({ rows: z.array(operatorPerfOut) }),
     async handler(ctx) {
