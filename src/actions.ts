@@ -523,9 +523,35 @@ async function learnAgentMessage(
   }
 }
 
-// 取已学话术（最新 N 条）拼进提示词当示范；用时 useCount+1。
+// 取已学话术拼进提示词当示范；用时 useCount+1。
+// 按债务人当前消息匹配 trigger（用户 2026-11-12 定）：先取 trigger 与当前
+// 消息有公共子串（≥2 字）的话术，按匹配长度、再按新旧排序；不够 N 条时
+// 用最新话术补满。trigger 是学话术时记下的债务人原话（见 learnAgentMessage
+// “供以后按场景参考”），只取最新 N 条会把老场景的话术埋掉。
+function normalizeMatchText(s: string): string {
+  return s.replace(/[\s\p{P}]/gu, "").toLowerCase();
+}
+function longestCommonSubstring(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0 || n === 0) return 0;
+  let best = 0;
+  const prev = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    const cur = new Array<number>(n + 1).fill(0);
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        cur[j] = prev[j - 1] + 1;
+        if (cur[j] > best) best = cur[j];
+      }
+    }
+    prev.splice(0, prev.length, ...cur);
+  }
+  return best;
+}
 async function loadLearnedScripts(
   ctx: Ctx,
+  debtorText = "",
   limit = 8,
 ): Promise<string[]> {
   const db = ctx.db<typeof schema>();
@@ -533,8 +559,33 @@ async function loadLearnedScripts(
     .select()
     .from(schema.learnedScripts)
     .orderBy(desc(schema.learnedScripts.id))
-    .limit(limit);
-  return rows.map((r) => r.text);
+    .limit(200);
+  if (rows.length === 0) return [];
+  const msg = normalizeMatchText(debtorText);
+  const scored = rows.map((r) => ({
+    row: r,
+    score: msg.length >= 2 && r.trigger
+      ? longestCommonSubstring(normalizeMatchText(r.trigger), msg)
+      : 0,
+  }));
+  const matched = scored
+    .filter((s) => s.score >= 2)
+    .sort((a, b) => b.score - a.score || b.row.id - a.row.id);
+  const picked: typeof rows = [];
+  const seen = new Set<number>();
+  for (const s of matched) {
+    if (picked.length >= limit) break;
+    picked.push(s.row);
+    seen.add(s.row.id);
+  }
+  for (const r of rows) {
+    if (picked.length >= limit) break;
+    if (!seen.has(r.id)) {
+      picked.push(r);
+      seen.add(r.id);
+    }
+  }
+  return picked.map((r) => r.text);
 }
 
 // 案件确认收款后调用：把该案最近未提的模型回复提进话术库，归一化去重。
@@ -5008,7 +5059,7 @@ const baseActions = {
       // SYSTEM 提示词按本案数值填好；history 只取最近 6 条当上下文。
       // 已学成功话术一并拼进提示词当示范。
       // 后台话术与关键词规则同一套 chat_scripts 表：后台改完，AI 即用同一套。
-      const learned = await loadLearnedScripts(ctx);
+      const learned = await loadLearnedScripts(ctx, args.text ?? "");
       let scripts: ChatScriptsData | null = null;
       try {
         scripts = await loadChatScripts(ctx);
